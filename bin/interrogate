@@ -1107,7 +1107,7 @@ run_step() {
     if run_citation_check "after $step"; then crc=0; else crc=1; fi
     rj_write '.steps[(.steps | length) - 1].citations = (.citation_checks[-1] | {citations, passed, failed, skipped, citations_json_sha256})'
     if [ "$crc" -ne 0 ]; then
-      die "citations in the notes don't resolve (listed above; details in $CIT_JSON). Stopping before the next step.
+      die "the notes have citations that don't resolve or a findings index that isn't valid (listed above; details in $CIT_JSON). Stopping before the next step.
   Fix the notes by hand, or re-run the step with --steps $step --force. --no-verify skips this check."
     fi
   fi
@@ -1146,7 +1146,7 @@ if [ "$DRY" -eq 0 ] && [ "$NO_VERIFY" -eq 0 ]; then
   if [ ${#keep[@]} -gt 0 ]; then
     echo "== checking citations in the notes already present"
     run_citation_check "existing notes at start" "${keep[@]}" \
-      || die "existing notes have citations that don't resolve (listed above). Fix them, re-run those steps with --force, or pass --no-verify."
+      || die "existing notes have citations that don't resolve or an invalid findings index (listed above). Fix them, re-run those steps with --force, or pass --no-verify."
   fi
 fi
 
