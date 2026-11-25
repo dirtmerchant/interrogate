@@ -970,6 +970,7 @@ run_step() {
   #  - The exact form for citing a measurement, which check-citations checks.
   #  - With --run-dir, where this run's notes are: the skills say .interrogate/.
   sys="This is an unattended assessment run. Shell commands run without approval only when each Bash call is one simple read-only command, or a pipeline of them, such as git log, git show, ls, or grep. Loops, variable assignments, command substitution, and chained commands are denied, so run one simple command per call. Reading files with the Read tool always works."
+  sys="$sys Every code citation is the file's full path from the current working directory, then the line, such as app/store.py:3, never the bare file name: each citation is checked, and store.py:3 does not resolve."
   sys="$sys Measurements of the assessed commit are in $OUT/metrics/. Cite a row of one as $OUT/metrics/<file>:<line>, for example $OUT/metrics/churn.tsv:12, where line 1 is the header."
   if [ "$OUT" != ".interrogate" ]; then
     sys="$sys For this run, the notes directory is $OUT/ (relative to the current working directory). Wherever the instructions say .interrogate/, read and write $OUT/ instead. Don't read or write notes anywhere else under .interrogate/."
