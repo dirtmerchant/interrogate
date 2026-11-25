@@ -1,0 +1,8 @@
+{
+  "name": "interrogate",
+  "description": "Interrogate an unfamiliar codebase's architecture in seven evidence-backed steps, one fresh context per step.",
+  "version": "0.1.0",
+  "author": {
+    "name": "dirtmerchant"
+  }
+}

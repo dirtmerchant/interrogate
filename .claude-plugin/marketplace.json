@@ -1,0 +1,14 @@
+{
+  "name": "interrogate",
+  "description": "Architecture interrogation for unfamiliar codebases.",
+  "owner": {
+    "name": "dirtmerchant"
+  },
+  "plugins": [
+    {
+      "name": "interrogate",
+      "source": "./",
+      "description": "Interrogate an unfamiliar codebase's architecture in seven evidence-backed steps, one fresh context per step."
+    }
+  ]
+}

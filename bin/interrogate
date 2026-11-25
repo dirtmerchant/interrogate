@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Run the architecture interrogation against a repository, one fresh
+# Claude Code session per step. A new process per step is the headless
+# equivalent of running /clear between steps.
+set -euo pipefail
+
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ALL_STEPS="orient patterns boundaries trace hotspots critique capture"
+
+usage() {
+  cat <<'EOF'
+Usage: interrogate [options] [target-dir]
+
+Runs seven read-only assessment steps against target-dir (default: current
+directory). Each step runs in its own Claude Code session and writes its
+findings to <target>/.interrogate/. The last step writes ARCHITECTURE.md.
+
+Options:
+  --steps a,b,c      Run only these steps, in the order given.
+                     Steps: orient patterns boundaries trace hotspots critique capture
+  --feature "text"   Feature or endpoint for the trace step. If omitted,
+                     Claude picks the most representative path.
+  --force            Re-run steps whose notes already exist.
+  --commit           Commit the notes after each step. On main or master,
+                     switches to a new branch interrogate/assessment first.
+  --trust-project    Load the target's own Claude Code settings, hooks, and
+                     MCP servers. Off by default: use it only for repositories
+                     you trust.
+  --model name       Model to use for every step.
+  --dry-run          Print the commands without running them.
+  -h, --help         Show this help.
+EOF
+}
+
+note_for() {
+  case "$1" in
+    orient)     echo "01-orient.md" ;;
+    patterns)   echo "02-patterns.md" ;;
+    boundaries) echo "03-boundaries.md" ;;
+    trace)      echo "04-trace.md" ;;
+    hotspots)   echo "05-hotspots.md" ;;
+    critique)   echo "06-critique.md" ;;
+    capture)    echo "issues.md" ;;
+    *) return 1 ;;
+  esac
+}
+
+STEPS="$ALL_STEPS"
+FEATURE=""
+FORCE=0
+COMMIT=0
+TRUST=0
+MODEL=""
+DRY=0
+TARGET=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --steps)         STEPS="$(echo "${2:?--steps needs a value}" | tr ',' ' ')"; shift 2 ;;
+    --feature)       FEATURE="${2:?--feature needs a value}"; shift 2 ;;
+    --force)         FORCE=1; shift ;;
+    --commit)        COMMIT=1; shift ;;
+    --trust-project) TRUST=1; shift ;;
+    --model)         MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --dry-run)       DRY=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              echo "interrogate: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *)               if [ -n "$TARGET" ]; then echo "interrogate: only one target directory" >&2; exit 2; fi
+                     TARGET="$1"; shift ;;
+  esac
+done
+
+for step in $STEPS; do
+  note_for "$step" >/dev/null || { echo "interrogate: unknown step '$step'" >&2; exit 2; }
+done
+
+TARGET="${TARGET:-.}"
+[ -d "$TARGET" ] || { echo "interrogate: $TARGET is not a directory" >&2; exit 2; }
+cd "$TARGET"
+
+if [ "$DRY" -eq 0 ]; then
+  command -v claude >/dev/null || { echo "interrogate: the claude CLI is not on PATH" >&2; exit 127; }
+fi
+
+IN_GIT=0
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT=1
+
+if [ "$COMMIT" -eq 1 ]; then
+  [ "$IN_GIT" -eq 1 ] || { echo "interrogate: --commit needs a git repository" >&2; exit 2; }
+  branch="$(git symbolic-ref --short -q HEAD || true)"
+  if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+    if [ "$DRY" -eq 1 ]; then
+      echo "+ git switch -c interrogate/assessment"
+    else
+      git switch -c interrogate/assessment
+    fi
+  fi
+fi
+
+# Everything not listed here that would need approval is denied by
+# --permission-mode dontAsk. File reads, searches, and Claude Code's built-in
+# read-only shell commands need no approval, so they still run.
+BASE_ALLOW='Edit(/.interrogate/**),Bash(git log *),Bash(git show *),Bash(git ls-files *),Bash(git blame *),Bash(git shortlog *),Bash(sort),Bash(sort -rn),Bash(sort -nr),Bash(uniq),Bash(uniq -c)'
+
+run_step() {
+  step="$1"
+  note=".interrogate/$(note_for "$step")"
+
+  if [ "$FORCE" -eq 0 ] && [ -s "$note" ]; then
+    echo "== $step: $note exists, skipping (use --force to re-run)"
+    return 0
+  fi
+
+  prompt="/interrogate:$step"
+  if [ "$step" = "trace" ] && [ -n "$FEATURE" ]; then
+    prompt="$prompt $FEATURE"
+  fi
+
+  allow="$BASE_ALLOW"
+  if [ "$step" = "capture" ]; then
+    allow="$allow,Edit(/ARCHITECTURE.md)"
+  fi
+
+  set -- claude -p "$prompt" --plugin-dir "$PLUGIN_ROOT" --permission-mode dontAsk --allowedTools "$allow"
+  if [ "$TRUST" -eq 0 ]; then set -- "$@" --setting-sources user; fi
+  if [ -n "$MODEL" ]; then set -- "$@" --model "$MODEL"; fi
+
+  echo "== $step"
+  if [ "$DRY" -eq 1 ]; then
+    printf '+'; printf ' %q' "$@"; printf '\n'
+    return 0
+  fi
+
+  mkdir -p .interrogate
+  if ! "$@" </dev/null; then
+    echo "interrogate: claude failed during step '$step'; nothing after it was run" >&2
+    exit 1
+  fi
+
+  if [ ! -s "$note" ]; then
+    echo "interrogate: step '$step' finished without writing $note" >&2
+    exit 1
+  fi
+
+  if [ "$COMMIT" -eq 1 ]; then
+    git add -- .interrogate
+    if [ -f ARCHITECTURE.md ]; then git add -- ARCHITECTURE.md; fi
+    if ! git diff --cached --quiet; then
+      git commit -q -m "interrogate: $step"
+      echo "== $step: committed"
+    fi
+  fi
+}
+
+for step in $STEPS; do
+  run_step "$step"
+done
+
+if [ "$DRY" -eq 0 ]; then
+  echo
+  echo "Notes are in $(pwd)/.interrogate/"
+  if [ -f ARCHITECTURE.md ]; then echo "Assessment: $(pwd)/ARCHITECTURE.md"; fi
+fi
