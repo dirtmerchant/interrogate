@@ -17,6 +17,7 @@ It runs seven steps, each in a fresh context window. Every finding has to cite `
 - [What it is allowed to do](#what-it-is-allowed-to-do)
 - [After the run](#after-the-run)
 - [What the record establishes](#what-the-record-establishes)
+- [Repeatability](#repeatability)
 - [Changing the prompts](#changing-the-prompts)
 - [Limits](#limits)
 - [Sources](#sources)
@@ -62,10 +63,10 @@ interrogate/bin/interrogate --dry-run /path/to/repo-to-assess
 
 Notes on individual steps:
 
-- **Patterns** counts something as *enforced* only if a mechanism stops violations: the type system, package visibility, a lint rule, an import check, or a test. Everything else is *aspirational*, and its violations are listed and counted.
-- **Boundaries** is a wide sweep, so it starts one subagent per top-level package. Each subagent explores in its own context and returns a short table. The main session then spot-checks at least three of the reported edges.
+- **Patterns** counts something as *enforced* only if a mechanism stops violations: the type system, package visibility, a lint rule, an import check, or a test. Everything else is *aspirational*, and its violations are listed and counted. It starts from the enforcement mechanisms the runner found (`metrics/enforcement.tsv`), and an Enforced claim must cite one.
+- **Boundaries** starts from the import table the runner extracted (`metrics/imports.tsv`). It is a wide sweep, so it starts one subagent per top-level package to check and complete that table. Each subagent explores in its own context and returns a short table. The main session then spot-checks at least three of the reported edges.
 - **Trace** takes an optional argument, such as `/interrogate:trace checkout flow`. With no argument it picks the path that best represents the system and says why. It asks specifically whether authorization is enforced where the decision is made, or assumed by a later layer.
-- **Hotspots** uses fan-in counts and git history (churn and co-change). In a repository with no history or a shallow clone it says so and falls back to fan-in.
+- **Hotspots** ranks from the runner's fan-in, churn, and co-change measurements rather than counting for itself. The ranking is still the model's judgment. In a repository with no history or a shallow clone it says so and falls back to fan-in.
 - **Critique** has to rank by severity, say what evidence would change each finding, and list what the design gets right to the same standard.
 - **Capture** doesn't explore again. It does re-check at least ten citations before writing and reports how many failed.
 
@@ -86,8 +87,14 @@ target-repo/
     ├── issues.md                    # step 7, one entry per finding worth filing
     ├── CLAUDE.proposed.md           # step 7, conventions an agent would get wrong
     ├── run.json                     # written by the runner: the record of the run
-    └── citations.json               # written by the runner: does each citation resolve?
+    ├── citations.json               # written by the runner: does each citation resolve?
+    └── metrics/                     # written by the runner: measurements at the commit
+        ├── files.tsv  churn.tsv  cochange.tsv
+        ├── imports.tsv  fanin.tsv  enforcement.tsv
+        └── summary.json
 ```
+
+With `--run-dir .interrogate/runs/a`, the same layout goes in `.interrogate/runs/a/` instead (see [Repeatability](#repeatability)).
 
 If the target already has an `ARCHITECTURE.md`, step 7 leaves it alone and writes `.interrogate/ARCHITECTURE.proposed.md` instead.
 
@@ -95,9 +102,37 @@ Step 7 never writes `CLAUDE.md`. That file changes how every later Claude Code s
 
 Whether you commit `.interrogate/` is up to you. Add it to `.gitignore` if you only want the final document.
 
+### Measurements
+
+Before the first step, the runner runs `bin/measure`, which measures the target at the pinned commit. It needs no model. It reads git's object store at that commit, not the working tree, so the same commit always gives byte-identical files, on any machine and on any day.
+
+| File | What it holds | How |
+| :- | :- | :- |
+| `files.tsv` | Language and line count per file | `git ls-tree` and `git diff --numstat` against the empty tree. Binary files show `-` |
+| `churn.tsv` | Commits and distinct authors per file | `git log --no-merges`, in a 365-day window that **ends at the commit's date**, not today. Author emails are counted, never written. Renames aren't followed |
+| `cochange.tsv` | File pairs that change in the same commits | The same window. Commits touching more than 50 files are skipped; pairs need 3 shared commits |
+| `imports.tsv` | One row per import statement, with its line, resolved target, and `internal`, `external`, or `unresolved` | Regular expressions for Python, JavaScript/TypeScript, Go, Java, and Kotlin |
+| `fanin.tsv` | Distinct importing files and directories per imported file or package | From `imports.tsv` |
+| `enforcement.tsv` | Configuration that can enforce an architectural rule | import-linter, dependency-cruiser, ESLint import rules, ArchUnit, Java modules, Go `internal/`, Bazel visibility, CODEOWNERS |
+| `summary.json` | The window, history depth, per-language coverage, each method's limits, and a hash of each file | |
+
+The steps cite measurements as `.interrogate/metrics/churn.tsv:12`, where line 1 is the header. `check-citations` resolves those rows, and also the short forms `metrics/churn.tsv:12` and `churn.tsv:12`, which models tend to write, but only when no file by that name exists in the code. Every number in the notes is labelled **measured**, citing a row, or **estimated**, saying how.
+
+The measurements are inputs, not findings. What they mean is still the model's judgment and yours. Their limits:
+
+- **Imports are a heuristic.** They miss dynamic imports, tsconfig path aliases, re-exports, and Python namespace packages, and can match import-like text in strings or comments. Languages other than the five above aren't measured. `summary.json` lists them with file counts, so a gap shows up as a gap, not as zero.
+- **Enforcement is configuration found, not enforcement proven.** Whether CI runs a check isn't visible from the tree.
+- **History is whatever the clone has.** A shallow clone is flagged in `summary.json`.
+
+You can run it yourself, for example before an interactive session:
+
+```bash
+bin/measure /path/to/repo-to-assess        # writes .interrogate/metrics/
+```
+
 ### The run record
 
-`run.json` and `citations.json` are written by `bin/interrogate`, never by the model. The model is denied write access to both, and the runner checks their hashes before and after every step and stops if either changed.
+`run.json`, `citations.json`, and `metrics/` are written by `bin/interrogate`, never by the model. The model is denied write access to all three, and the runner checks their hashes before and after every step and stops if any changed.
 
 `run.json` (`schema_version: 1`) records:
 
@@ -141,6 +176,8 @@ Usage: interrogate [options] [target-dir]
                      google-cloud, foundry, or other.
   --no-verify        Don't run check-citations after each step.
   --trust-notes      Accept notes files that are tracked in the target's git history.
+  --effort level     Effort level for every step: low, medium, high, xhigh, or max.
+  --run-dir dir      Write this run's notes, metrics, and record to dir (inside the target).
   --dry-run          Print the commands without running them.
   --verify           Run nothing. Recheck the hashes in run.json.
 ```
@@ -180,6 +217,9 @@ Behavior worth knowing:
 - **`--verify`.** Recomputes the SHA-256 of every file `run.json` recorded and reports `OK`, `CHANGED`, or `MISSING` for each. It runs no model and needs no network. Editing a notes file by hand between steps is allowed, and `--verify` will then report it as changed, which is the point.
 - **`--commit`.** Commits `.interrogate/` and `ARCHITECTURE.md` after each step with the message `interrogate: <step>`. If the current branch is `main` or `master`, it first switches to a new branch named `interrogate/assessment`. It never pushes.
 - **Cost.** Seven sessions, one of which fans out to subagents. On a large repository this is not cheap. Use `--steps` to run part of it, and `--model` to choose a cheaper model for a first pass.
+- **Measurements first.** Before the first step, `bin/measure` writes `metrics/` for the pinned commit. On resume, the existing measurements are kept if they still match `run.json`.
+- **Session notes.** Each step gets a short appended system prompt, recorded in `run.json`: run one simple command per Bash call (`dontAsk` denies loops, variables, and `$(…)`, and early runs gave up on Bash after one denial), cite full paths rather than bare file names, the form for citing a measurement, and, with `--run-dir`, where the notes are. It describes how the run is set up. It doesn't change what a step assesses.
+- **Findings index.** The patterns and hotspots notes end with a fixed-format table (see [Repeatability](#repeatability)). `check-citations` validates it, and a missing or malformed index stops the run like a broken citation.
 - **Output.** Each step runs with `--output-format stream-json`, which is how the runner gets the session ID, cost, and the model the session ran on. Tool calls are echoed as one-line progress, and the step's final reply is printed when it finishes.
 - **Bash.** The scripts avoid Bash 4 features, so they run on the Bash 3.2 that ships with macOS. They need `git` and `jq`.
 
@@ -226,6 +266,7 @@ Two things differ from the unattended runner:
 - **Permissions are whatever your session uses.** Start in the default mode and approve the one notes-file write per step. Plan mode blocks that write, so the step can't save its findings.
 - **The target's Claude Code settings load as usual**, after the normal trust prompt.
 - **No run record.** `run.json` comes from the runner, so an interactive session leaves only the notes. You can still check the citations with `bin/check-citations`, which resolves against `HEAD`.
+- **No measurements unless you make them.** Run `bin/measure` first if you want measured numbers. Otherwise the steps estimate, and say so.
 
 You can edit a notes file between steps. Later steps treat the notes as leads to verify, and step 7 builds only from what the notes contain.
 
@@ -242,7 +283,7 @@ The unattended runner passes `--permission-mode dontAsk` with a one-rule allow l
 | `git log`, `git show`, `git ls-files`, `git blame`, `git shortlog`, and the churn pipeline in step 5 | Yes, as built-in read-only commands |
 | `git log --output=<file>`, `git show --output=<file>` | No |
 | Write files under `.interrogate/` | Yes: `Edit(/.interrogate/**)` |
-| Write `.interrogate/run.json` or `.interrogate/citations.json` | No: explicit deny rules; only the runner writes them |
+| Write `.interrogate/run.json`, `.interrogate/citations.json`, or anything in `.interrogate/metrics/` | No: explicit deny rules; only the runner writes them |
 | Write `ARCHITECTURE.md` | Step 7 only, and only if the file didn't exist when the run started. Otherwise it is denied, and step 7 writes `.interrogate/ARCHITECTURE.proposed.md` |
 | Write anywhere else, run other shell commands, fetch from the network | No |
 
@@ -281,6 +322,53 @@ What the record does not establish:
 
 Planned work, not in this release: signing or attesting `run.json`, a record of the human review, one directory per run, and findings with stable IDs.
 
+## Repeatability
+
+A model doesn't give the same answer twice. `claude -p` has no temperature or seed setting (checked against `claude --help` for 2.1.332), so the runner can't make a step deterministic. What it does instead is pin everything else, then measure the variance that's left.
+
+**Pinned, and recorded in `run.json`:**
+
+- the commit, and the tree at it
+- the measurements, which are byte-identical for a commit
+- the skill prompts, by hash
+- the model: pass a full model ID such as `claude-opus-5-5`. An alias such as `opus` gets a warning, because it resolves to whatever model is current. Each step records the model it actually ran on, and flags a suspected fallback to another model.
+- the effort level, with `--effort`
+
+**Not pinned:** the model's sampling. Two runs can read different files, cite different lines, and rank differently.
+
+**Measuring the variance.** Run the same steps into separate directories, then compare:
+
+```bash
+bin/interrogate --run-dir .interrogate/runs/a --model claude-opus-5-5 --effort medium ~/src/svc
+bin/interrogate --run-dir .interrogate/runs/b --model claude-opus-5-5 --effort medium ~/src/svc
+bin/interrogate --run-dir .interrogate/runs/c --model claude-opus-5-5 --effort medium ~/src/svc
+bin/compare-runs ~/src/svc/.interrogate/runs/{a,b,c}
+```
+
+`compare-runs` needs no model. It refuses runs of different commits, warns about differing prompts, models, or effort, and reports:
+
+- **per step:** how far the runs cite the same files (Jaccard) and the same lines (overlapping ranges), and which files every run cited or only one did
+- **hotspots:** overlap of the ranked lists, and whether shared items are in the same order
+- **patterns:** which patterns every run found, and whether they agree on Enforced or Aspirational
+
+It reads the comparison from the **findings index** at the end of the patterns and hotspots notes, a fixed-format table the steps are told to write and `check-citations` validates:
+
+```
+<!-- findings-index: hotspots -->
+| rank | path | fanin | churn_window | measured |
+```
+
+```
+<!-- findings-index: patterns -->
+| pattern | scope | status | violations |
+```
+
+Patterns are matched across runs by name, ignoring case and punctuation. There are no stable finding IDs yet.
+
+**How to read it.** Agreement means the runs pointed at the same code, not that they are right. A finding every run produced is more likely to reflect the code than the sampling. A finding only one run produced is a lead to check, not a conclusion. For anything going to an assessor, run at least three times and report the agreement with the findings.
+
+**What one test showed.** On a 14-file scripted fixture, three hotspots runs with the same inputs, model, and effort ranked the same five files in the same order, and 90% of their citations overlapped at line level (72% at file level). The fixture's measured numbers nearly force that ranking, so this shows that pinned inputs carry through to the output. It doesn't predict agreement on a real codebase, where judgment does more of the work.
+
 ## Changing the prompts
 
 Each step is one Markdown file at `skills/<step>/SKILL.md`: YAML frontmatter, then the prompt. Edit the prompt, then run `/reload-plugins` in an open session, or just re-run the runner.
@@ -291,7 +379,7 @@ Check your edits with:
 claude plugin validate .
 ```
 
-If you add a step, also add it to `ALL_STEPS` and `note_for` in `bin/interrogate`, and have the previous step name it as the next command.
+If you add a step, also add it to `ALL_STEPS` and `note_for` in `bin/interrogate`, and have the previous step name it as the next command. Keep the findings index format in the patterns and hotspots prompts as it is: `check-citations` and `compare-runs` parse it.
 
 Ideas that fit the same shape: a data-model step, a test-strategy step, or a dependency and supply-chain step that asks what is pinned and what has provenance.
 
@@ -300,8 +388,9 @@ Ideas that fit the same shape: a data-model step, a test-strategy step, or a dep
 - **It reads code. It doesn't run it.** Nothing is built, executed, or tested, so runtime behavior, performance, and configuration that only exists in a deployed environment are out of view.
 - **Citations can point at the wrong thing.** The runner checks that every citation resolves to real lines at the recorded commit. It can't check that those lines say what the finding claims. Step 7 also re-reads a sample of ten.
 - **Very large or monorepo codebases** may need the steps pointed at one service at a time. Run the tool from that service's directory.
-- **Findings vary between runs.** Treat a single run as one reviewer's opinion.
-- **Not yet validated end to end.** The orient step has been run against a model, on a six-file fixture. The other six steps haven't been run against a model yet.
+- **Findings vary between runs.** Treat a single run as one reviewer's opinion, and use `--run-dir` and `bin/compare-runs` to see how much they vary. See [Repeatability](#repeatability).
+- **Measurements are partial.** Imports are measured for five language families by pattern matching, and configuration found is not proof of enforcement. See [Measurements](#measurements).
+- **Not yet validated end to end.** Orient, patterns, boundaries, trace, and hotspots have been run against a model, on small fixtures. Critique and capture haven't been yet.
 - **Provider detection is static.** It sees the environment and the settings files it can read, not server-managed settings or MDM profiles. See [the run record](#the-run-record).
 
 ## Sources
