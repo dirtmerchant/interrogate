@@ -118,7 +118,6 @@ case "$REQUIRE_PROVIDER" in
 esac
 
 need_jq "$SELF"
-[ "$VERIFY" -eq 0 ] || DIE_STATUS=2 die "--verify is not implemented yet"
 
 TARGET="${TARGET:-.}"
 [ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
@@ -126,6 +125,75 @@ cd "$TARGET"
 TARGET_ABS="$(pwd -P)"
 RUN_JSON=".interrogate/run.json"
 CIT_JSON=".interrogate/citations.json"
+
+# ---------------------------------------------------------------------------
+# --verify: recompute the hash of every file run.json recorded and report any
+# that no longer match. Needs no model and no network.
+#
+# This catches accidental edits. It does not prove the files weren't altered
+# on purpose: run.json is unsigned, so anyone who edits a notes file can also
+# edit the hash recorded for it.
+# ---------------------------------------------------------------------------
+do_verify() {
+  [ -f "$RUN_JSON" ] || DIE_STATUS=2 die "no $RUN_JSON in $TARGET_ABS; nothing to verify"
+  jq -e --argjson v "$SCHEMA_VERSION" '.schema_version == $v' "$RUN_JSON" >/dev/null 2>&1 \
+    || DIE_STATUS=2 die "$RUN_JSON is not a schema_version $SCHEMA_VERSION run record"
+
+  echo "Verifying $TARGET_ABS against $RUN_JSON"
+  echo "(unsigned record: this detects accidental changes, not deliberate ones)"
+  jq -r '"  pinned to: \(if .target.is_git then "commit " + .target.commit else "working tree (not a git repository)" end)\(if .target.dirty_at_start then ", tree was dirty at start" else "" end)"' "$RUN_JSON"
+  if [ "$(jq -r '.target.is_git' "$RUN_JSON")" = "true" ]; then
+    local head
+    head="$(git rev-parse -q --verify HEAD 2>/dev/null || echo none)"
+    echo "  HEAD now:  $head"
+  fi
+  echo
+
+  # Expected hash per path: the latest step that wrote it. A file recorded
+  # only as adopted from an earlier run counts when no step wrote it.
+  local expected bad=0 n=0 path want got state
+  expected="$(jq -r '
+    (reduce .steps[] as $s ({};
+      reduce ($s.outputs // [])[] as $o (.;
+        if $s.status == "adopted" and has($o.path) then . else .[$o.path] = $o.sha256 end)))
+    + (if .architecture_md.sha256 then {"ARCHITECTURE.md": .architecture_md.sha256} else {} end)
+    + (if (.citation_checks | length) > 0 then {".interrogate/citations.json": .citation_checks[-1].citations_json_sha256} else {} end)
+    | to_entries[] | "\(.key)\t\(.value)"' "$RUN_JSON")"
+
+  while IFS='	' read -r path want; do
+    [ -n "$path" ] || continue
+    n=$((n + 1))
+    if [ ! -f "$path" ]; then
+      state="MISSING"; bad=$((bad + 1))
+    else
+      got="$(sha256_file "$path")"
+      if [ "$got" = "$want" ]; then state="OK"; else state="CHANGED"; bad=$((bad + 1)); fi
+    fi
+    printf '  %-8s %s\n' "$state" "$path"
+  done <<<"$expected"
+
+  # Informational: the plugin prompts may have changed since the run.
+  local sk
+  sk="$(jq -r '.invocations[-1].plugin.skills | to_entries[] | "\(.key)\t\(.value.sha256)"' "$RUN_JSON")"
+  while IFS='	' read -r path want; do
+    [ -n "$path" ] || continue
+    if [ ! -f "$PLUGIN_ROOT/skills/$path/SKILL.md" ] || [ "$(sha256_file "$PLUGIN_ROOT/skills/$path/SKILL.md")" != "$want" ]; then
+      echo "  note: skills/$path/SKILL.md in this copy of the plugin differs from the one the run used"
+    fi
+  done <<<"$sk"
+
+  echo
+  if [ "$bad" -eq 0 ]; then
+    echo "verify: all $n recorded files match run.json"
+    return 0
+  fi
+  echo "verify: $bad of $n recorded files no longer match run.json"
+  return 1
+}
+
+if [ "$VERIFY" -eq 1 ]; then
+  if do_verify; then exit 0; else exit 1; fi
+fi
 
 # ---------------------------------------------------------------------------
 # Provider detection. Runs before anything else so that --require-provider
