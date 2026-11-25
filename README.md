@@ -16,6 +16,7 @@ It runs seven steps, each in a fresh context window. Every finding has to cite `
 - [Running interactively](#running-interactively)
 - [What it is allowed to do](#what-it-is-allowed-to-do)
 - [After the run](#after-the-run)
+- [What the record establishes](#what-the-record-establishes)
 - [Changing the prompts](#changing-the-prompts)
 - [Limits](#limits)
 - [Sources](#sources)
@@ -32,7 +33,7 @@ So each step here has a narrow question, starts with an empty context, reads the
 
 ## Quick start
 
-You need [Claude Code](https://code.claude.com/docs) installed and signed in, and `git`.
+You need [Claude Code](https://code.claude.com/docs) installed and signed in, `git`, and `jq`. macOS 15 and later ship `jq` at `/usr/bin/jq`; elsewhere install it with your package manager.
 
 ```bash
 git clone https://github.com/dirtmerchant/interrogate.git
@@ -83,7 +84,9 @@ target-repo/
     ├── 05-hotspots.md
     ├── 06-critique.md
     ├── issues.md                    # step 7, one entry per finding worth filing
-    └── CLAUDE.proposed.md           # step 7, conventions an agent would get wrong
+    ├── CLAUDE.proposed.md           # step 7, conventions an agent would get wrong
+    ├── run.json                     # written by the runner: the record of the run
+    └── citations.json               # written by the runner: does each citation resolve?
 ```
 
 If the target already has an `ARCHITECTURE.md`, step 7 leaves it alone and writes `.interrogate/ARCHITECTURE.proposed.md` instead.
@@ -91,6 +94,35 @@ If the target already has an `ARCHITECTURE.md`, step 7 leaves it alone and write
 Step 7 never writes `CLAUDE.md`. That file changes how every later Claude Code session behaves in the repository, so the proposal is kept separate for its own review.
 
 Whether you commit `.interrogate/` is up to you. Add it to `.gitignore` if you only want the final document.
+
+### The run record
+
+`run.json` and `citations.json` are written by `bin/interrogate`, never by the model. The model is denied write access to both, and the runner checks their hashes before and after every step and stops if either changed.
+
+`run.json` (`schema_version: 1`) records:
+
+- **What was assessed:** the target path, the commit SHA at the start, and whether the tree was dirty. A non-git target is recorded as such, with no commit.
+- **What did the assessing:** this plugin's version and commit, a SHA-256 of each `SKILL.md`, and the Claude Code version.
+- **Where the code went:** the provider (`anthropic`, `bedrock`, `google-cloud`, `foundry`, or `other`), the endpoint host, and the region, each with the setting it came from. Values that can't be determined are recorded as unknown, with the reason. Only host names, regions, and variable names are written: never credentials, tokens, or full URLs.
+- **Under what permissions:** the permission mode, and the exact allow and deny lists for each step.
+- **Each step:** start and end time, exit status, session ID, cost, the model the session actually ran on (from the session itself, not the alias requested), any tool calls that were denied, and a SHA-256 of every file it wrote under `.interrogate/`. `ARCHITECTURE.md` is hashed once a step writes it.
+- **Each citation check:** counts, and the hash of the `citations.json` it produced.
+
+`citations.json` lists every `path:line` and `path:line-line` citation in the notes, with `pass`, `fail`, or `skip` and a reason (`file missing at commit …`, `line 40 out of range (file has 7 lines)`). Citations resolve against the recorded commit, or the working tree for a non-git target.
+
+A finding in the notes is not evidence. The cited code at the recorded commit is the evidence, and the finding points to it. A `pass` means the pointer resolves: the file exists and the lines are in range. It does not mean the cited lines support the claim. That needs a human reviewer.
+
+You can run the check yourself, without a model:
+
+```bash
+bin/check-citations /path/to/repo-to-assess        # exits 1 if any citation fails
+```
+
+How citations are recognized, and where that goes wrong:
+
+- **Recognized:** a run of path characters containing a `/` or a `.`, or a well-known extensionless name (`Makefile`, `Dockerfile`, and similar), then `:line` or `:line-line`. A trailing `:column` is ignored. Citations of the notes themselves (`.interrogate/…`) are skipped.
+- **Not recognized (missed):** paths with spaces, GitHub-style `path#L12-L20`, ranges written with an en dash, prose like "line 12 of `foo.go`", a citation split across a line break, and extensionless files not on the list.
+- **Recognized wrongly (false failures):** `host.tld:port` written without a scheme, and dotted names followed by a number, such as `node.js:18`. These fail as "file missing", so they show up rather than pass silently. URLs with a scheme, version numbers, IP addresses, and times are excluded.
 
 ## Running unattended
 
@@ -102,8 +134,15 @@ Usage: interrogate [options] [target-dir]
   --force            Re-run steps whose notes already exist.
   --commit           Commit the notes after each step.
   --trust-project    Load the target's own Claude Code settings, hooks, and MCP servers.
-  --model name       Model to use for every step.
+  --model name       Model to request for every step. run.json records the model actually used.
+  --allow-dirty      Run even though the target has uncommitted changes.
+  --require-provider name
+                     Refuse to start unless the provider is anthropic, bedrock,
+                     google-cloud, foundry, or other.
+  --no-verify        Don't run check-citations after each step.
+  --trust-notes      Accept notes files that are tracked in the target's git history.
   --dry-run          Print the commands without running them.
+  --verify           Run nothing. Recheck the hashes in run.json.
 ```
 
 The runner starts a new `claude -p` process for each step. A new process has an empty context window, so this is the unattended equivalent of running `/clear` between steps.
@@ -122,15 +161,27 @@ bin/interrogate --steps critique,capture --force ~/src/some-service
 
 # Commit each step's notes as it finishes
 bin/interrogate --commit ~/src/some-service
+
+# Only run if the code would go to Amazon Bedrock
+bin/interrogate --require-provider bedrock ~/src/some-service
+
+# Later: has anything in the record changed since the run?
+bin/interrogate --verify ~/src/some-service
 ```
 
 Behavior worth knowing:
 
-- **Resume.** A step is skipped when its notes file exists and is non-empty. `--force` overrides that.
-- **Failure.** If `claude` exits non-zero, or a step finishes without writing its notes, the runner stops and later steps don't run.
+- **Pinned to a commit.** The runner records the target's `HEAD` at the start. If the tree has uncommitted changes (outside `.interrogate/`), it refuses to run unless you pass `--allow-dirty`, and records that the tree was dirty. With `--allow-dirty`, citations still resolve against the commit, not your edits.
+- **Resume.** A step is skipped when its notes file exists and is non-empty. `--force` overrides that. Resume refuses if `HEAD` is no longer the commit in `run.json`, so notes from two revisions are never mixed. The runner's own `--commit` commits are the one exception. To assess a new revision, move `.interrogate/` aside and start again.
+- **Notes from git history.** If a notes file (or `run.json`) is tracked in the target's git history in a commit the runner didn't make, resume won't treat it as a finished step: a committed notes file may not come from an assessment at all. Re-run that step with `--force`, or pass `--trust-notes` to accept it. The acceptance is recorded.
+- **Citation check.** After every step, and once at the start for notes kept from an earlier run, the runner runs `bin/check-citations`. If any citation fails to resolve, the run stops. Fix the notes or re-run the step with `--force`; `--no-verify` skips the check, and `run.json` records that it was skipped.
+- **Failure.** If `claude` exits non-zero or reports an error, or a step finishes without writing its notes, the runner records the step and stops. Later steps don't run.
+- **Provider gate.** `--require-provider` reads the environment and the `env` blocks of the settings files Claude Code would load, works out the provider, and refuses to start, before any session and before any code is read, if it doesn't match or can't be determined. The detection is printed at the start of every run. It is a static reading. Server-managed settings and macOS configuration profiles aren't visible to it, so after each step the runner also compares it with the provider the session reported and stops on a mismatch. That reported field is not documented by Claude Code, so treat the cross-check as a backstop.
+- **`--verify`.** Recomputes the SHA-256 of every file `run.json` recorded and reports `OK`, `CHANGED`, or `MISSING` for each. It runs no model and needs no network. Editing a notes file by hand between steps is allowed, and `--verify` will then report it as changed, which is the point.
 - **`--commit`.** Commits `.interrogate/` and `ARCHITECTURE.md` after each step with the message `interrogate: <step>`. If the current branch is `main` or `master`, it first switches to a new branch named `interrogate/assessment`. It never pushes.
 - **Cost.** Seven sessions, one of which fans out to subagents. On a large repository this is not cheap. Use `--steps` to run part of it, and `--model` to choose a cheaper model for a first pass.
-- **Bash.** The script avoids Bash 4 features, so it runs on the Bash 3.2 that ships with macOS.
+- **Output.** Each step runs with `--output-format stream-json`, which is how the runner gets the session ID, cost, and the model the session ran on. Tool calls are echoed as one-line progress, and the step's final reply is printed when it finishes.
+- **Bash.** The scripts avoid Bash 4 features, so they run on the Bash 3.2 that ships with macOS. They need `git` and `jq`.
 
 ## Running interactively
 
@@ -174,6 +225,7 @@ Two things differ from the unattended runner:
 
 - **Permissions are whatever your session uses.** Start in the default mode and approve the one notes-file write per step. Plan mode blocks that write, so the step can't save its findings.
 - **The target's Claude Code settings load as usual**, after the normal trust prompt.
+- **No run record.** `run.json` comes from the runner, so an interactive session leaves only the notes. You can still check the citations with `bin/check-citations`, which resolves against `HEAD`.
 
 You can edit a notes file between steps. Later steps treat the notes as leads to verify, and step 7 builds only from what the notes contain.
 
@@ -181,17 +233,20 @@ The skills are marked `disable-model-invocation`, so Claude never starts one on 
 
 ## What it is allowed to do
 
-The unattended runner passes `--permission-mode dontAsk` with a short allow list. In that mode Claude Code denies anything that would otherwise ask for approval, so the limits below are enforced by Claude Code, not requested in a prompt.
+The unattended runner passes `--permission-mode dontAsk` with a one-rule allow list. In that mode Claude Code denies anything that would otherwise ask for approval, so the limits below are enforced by Claude Code, not requested in a prompt.
 
 | Action | Allowed |
 | :- | :- |
 | Read and search files in the target | Yes |
-| Claude Code's built-in read-only shell commands (`ls`, `cat`, `grep`, `find`, read-only `git`, and similar) | Yes |
-| `git log`, `git show`, `git ls-files`, `git blame`, `git shortlog` | Yes |
-| `sort`, `sort -rn`, `sort -nr`, `uniq`, `uniq -c` (exact forms, for the churn pipeline) | Yes |
-| Write files under `.interrogate/` | Yes |
-| Write `ARCHITECTURE.md` | Step 7 only |
+| Claude Code's built-in read-only shell commands (`ls`, `cat`, `grep`, `find`, `sort`, read-only `git`, and similar) | Yes, with no rule from the runner |
+| `git log`, `git show`, `git ls-files`, `git blame`, `git shortlog`, and the churn pipeline in step 5 | Yes, as built-in read-only commands |
+| `git log --output=<file>`, `git show --output=<file>` | No |
+| Write files under `.interrogate/` | Yes: `Edit(/.interrogate/**)` |
+| Write `.interrogate/run.json` or `.interrogate/citations.json` | No: explicit deny rules; only the runner writes them |
+| Write `ARCHITECTURE.md` | Step 7 only, and only if the file didn't exist when the run started. Otherwise it is denied, and step 7 writes `.interrogate/ARCHITECTURE.proposed.md` |
 | Write anywhere else, run other shell commands, fetch from the network | No |
+
+The runner adds no Bash rules. With Claude Code 2.1.332 in `dontAsk` mode and no allow rules, every git command step 5 uses, and its `sort | uniq -c | sort -rn | head` pipeline, ran as built-in read-only commands, and the `--output=<file>` forms were denied. Earlier versions of the runner allowed `Bash(git log *)` and `Bash(git show *)`, which approved those `--output` forms. Claude Code decides what counts as read-only, and that can change between versions: `run.json` records the version, and anything a future version stops treating as read-only is denied, not allowed. Commands the model builds with `$(…)` substitution, or with a file argument to `uniq`, are denied too, and `run.json` lists each denied call.
 
 The runner also passes `--setting-sources user` by default. A `claude -p` run shows no workspace trust dialog, so without that flag the target repository's own hooks and `.mcp.json` servers would run on your machine unprompted. A repository you are assessing for the first time is one you haven't vetted. Pass `--trust-project` only when you trust the target.
 
@@ -201,11 +256,30 @@ Permission rules are not a sandbox. For a repository you don't trust at all, run
 
 The plugin stops at files. It doesn't commit to your default branch, push, open pull requests, or file issues. A suggested order:
 
-1. **Read `ARCHITECTURE.md` yourself** and check a few citations. It is a model's assessment.
+1. **Read `ARCHITECTURE.md` yourself.** It is a model's assessment. Every citation in it resolved (see `.interrogate/citations.json`), but whether each cited line supports its claim is for you to check: open a sample and read them.
 2. **Open one pull request with `ARCHITECTURE.md`.** Maintainers who know the code disputing the findings is the real review of the assessment.
 3. **Review `.interrogate/CLAUDE.proposed.md`.** If you adopt it, open a separate pull request.
 4. **File issues from `.interrogate/issues.md`.** Each entry has a title, evidence, severity, and suggested scope. It describes the problem and leaves the fix open.
 5. **Fix findings later**, one pull request per issue, each in its own session.
+
+## What the record establishes
+
+The output is a reviewable record of one architecture review, tied to the commit it reviewed, with citations that resolve. In a regulated setting, an assessor tends to ask four things of an artifact like this. Here is where each stands:
+
+| Question | Status |
+| :- | :- |
+| Is it tied to what was assessed? | **Yes.** `run.json` records the commit, whether the tree was dirty, and the plugin version and prompt hashes. Citations resolve against that commit. Resume refuses to mix revisions. |
+| Could it have been altered? | **Partly.** The model can't write the run record, and `--verify` detects files that changed after the run. But `run.json` is unsigned, so anyone who can edit a notes file can also edit its recorded hash. That makes it a check against accidents, not a tamper-proof record. |
+| Can it be verified without trusting the tool? | **Partly.** `check-citations` and `--verify` are short shell scripts that use only `git`, `jq`, and `shasum`, and need no model. The citation check confirms that a citation points at real lines. Whether those lines support the finding is a human reviewer's call. |
+| Where did the source code go? | **Recorded, with stated limits.** The provider, endpoint host, and region are recorded, and `--require-provider` can refuse to start. Detection reads the environment and the settings files the runner can see. Server-managed settings and macOS configuration profiles are invisible to it and are listed as not read. |
+
+What the record does not establish:
+
+- **That a finding is correct.** The model's findings are claims. The evidence is the cited code.
+- **A control assessment.** This reviews architecture, not whether a control objective is met.
+- **That it is tamper-proof.** Not yet.
+
+Planned work, not in this release: signing or attesting `run.json`, a record of the human review, one directory per run, and findings with stable IDs.
 
 ## Changing the prompts
 
@@ -224,10 +298,11 @@ Ideas that fit the same shape: a data-model step, a test-strategy step, or a dep
 ## Limits
 
 - **It reads code. It doesn't run it.** Nothing is built, executed, or tested, so runtime behavior, performance, and configuration that only exists in a deployed environment are out of view.
-- **Citations can be wrong.** Step 7 re-checks a sample, not all of them.
+- **Citations can point at the wrong thing.** The runner checks that every citation resolves to real lines at the recorded commit. It can't check that those lines say what the finding claims. Step 7 also re-reads a sample of ten.
 - **Very large or monorepo codebases** may need the steps pointed at one service at a time. Run the tool from that service's directory.
 - **Findings vary between runs.** Treat a single run as one reviewer's opinion.
-- **Not yet validated end to end.** See the status note at the top.
+- **Not yet validated end to end.** The orient step has been run against a model, on a six-file fixture. The other six steps haven't been run against a model yet.
+- **Provider detection is static.** It sees the environment and the settings files it can read, not server-managed settings or MDM profiles. See [the run record](#the-run-record).
 
 ## Sources
 
@@ -237,5 +312,7 @@ The prompts apply Anthropic's published Claude Code guidance to architecture ass
 - [Common workflows](https://code.claude.com/docs/en/common-workflows): understanding a new codebase
 - [Prompt library](https://code.claude.com/docs/en/prompt-library)
 - [Run Claude Code programmatically](https://code.claude.com/docs/en/headless): `claude -p` and its flags
-- [Permissions](https://code.claude.com/docs/en/permissions): rule syntax, `dontAsk`, and what runs in an untrusted folder
+- [Permissions](https://code.claude.com/docs/en/permissions): rule syntax, `dontAsk`, read-only commands, and what runs in an untrusted folder
+- [Environment variables](https://code.claude.com/docs/en/env-vars) and [settings](https://code.claude.com/docs/en/settings): how provider, endpoint, and region are chosen, and settings precedence
+- Provider setup: [Amazon Bedrock](https://code.claude.com/docs/en/amazon-bedrock), [Google Cloud](https://code.claude.com/docs/en/google-vertex-ai), [Microsoft Foundry](https://code.claude.com/docs/en/microsoft-foundry), [LLM gateways](https://code.claude.com/docs/en/llm-gateway)
 - [Create a plugin](https://code.claude.com/docs/en/plugins/create)

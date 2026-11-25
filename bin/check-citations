@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# Check that every path:line citation in the interrogate notes resolves.
+#
+# A finding written by a model is not evidence. The cited code is the
+# evidence, and the finding points to it. This script checks only the
+# pointer: that the cited file exists at the assessed commit and that the
+# cited lines are within it. Whether the cited lines support the claim is a
+# judgment for a human reviewer, and nothing here attempts it.
+#
+# Needs bash 3.2+, git (for git targets), and jq.
+set -euo pipefail
+
+SELF="check-citations"
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$PLUGIN_ROOT/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: check-citations [options] [target-dir] [notes-file ...]
+
+Extracts every path:line and path:line-line citation from the notes files,
+resolves each one, and writes a per-citation pass/fail report. Exits 0 when
+every citation resolves, 1 when any fails, 2 on a usage error.
+
+Citations resolve against the commit recorded in .interrogate/run.json, or
+HEAD if there is no run.json. For a target that is not a git repository they
+resolve against the working tree.
+
+With no notes files given, checks every .interrogate/*.md.
+
+Options:
+  --commit SHA      Resolve against this commit instead.
+  --worktree        Resolve against the working tree, even in a git repository.
+  --include FILE    Also check FILE (repeatable), e.g. ARCHITECTURE.md.
+  --out FILE        Where to write the report (default .interrogate/citations.json,
+                    relative to target-dir). Use - for stdout.
+  -q, --quiet       Print only the summary line and failures.
+  -h, --help        Show this help.
+
+A pass means the file and lines exist. It does not mean they support the
+claim made about them.
+EOF
+}
+
+COMMIT=""
+WORKTREE=0
+OUT=".interrogate/citations.json"
+QUIET=0
+TARGET=""
+NOTES=()
+INCLUDES=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --commit)   COMMIT="${2:?--commit needs a value}"; shift 2 ;;
+    --worktree) WORKTREE=1; shift ;;
+    --include)  INCLUDES+=("${2:?--include needs a value}"); shift 2 ;;
+    --out)      OUT="${2:?--out needs a value}"; shift 2 ;;
+    -q|--quiet) QUIET=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         echo "$SELF: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *)          if [ -z "$TARGET" ]; then TARGET="$1"; else NOTES+=("$1"); fi; shift ;;
+  esac
+done
+
+need_jq "$SELF"
+TARGET="${TARGET:-.}"
+[ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
+cd "$TARGET"
+
+IN_GIT=0
+PREFIX=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  IN_GIT=1
+  PREFIX="$(git rev-parse --show-prefix)"
+fi
+
+# Decide what to resolve against.
+MODE="worktree"
+if [ "$WORKTREE" -eq 0 ] && [ "$IN_GIT" -eq 1 ]; then
+  if [ -z "$COMMIT" ] && [ -f .interrogate/run.json ]; then
+    COMMIT="$(jq -r '.target.commit // empty' .interrogate/run.json 2>/dev/null || true)"
+  fi
+  if [ -z "$COMMIT" ]; then
+    COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
+  fi
+  if [ -n "$COMMIT" ]; then
+    COMMIT="$(git rev-parse --verify -q "$COMMIT^{commit}" || true)"
+    [ -n "$COMMIT" ] || { echo "$SELF: commit not found in this repository" >&2; exit 2; }
+    MODE="commit"
+  fi
+fi
+
+# Default notes set: every Markdown file the steps write under .interrogate/.
+if [ ${#NOTES[@]} -eq 0 ]; then
+  for f in .interrogate/*.md; do
+    [ -f "$f" ] && NOTES+=("$f")
+  done
+fi
+if [ ${#INCLUDES[@]} -gt 0 ]; then
+  for f in "${INCLUDES[@]}"; do
+    [ -f "$f" ] && NOTES+=("$f")
+  done
+fi
+
+W="$(mktemp -d "${TMPDIR:-/tmp}/check-citations.XXXXXX")"
+trap 'rm -rf "$W"' EXIT
+: > "$W/cites"
+: > "$W/files"
+
+# The citation pattern. A token of path characters, a colon, a line number,
+# and optionally -endline. The character before the token must not be a path
+# character, a colon, or a slash, which keeps URLs (https://host:443) out.
+# A :column suffix after the line is allowed and ignored.
+RE='(^|[^A-Za-z0-9_./:@+~-])([A-Za-z0-9_./@+-][A-Za-z0-9_./@+~-]*):([0-9]+)(-([0-9]+))?'
+
+# Tokens that have neither a slash nor a dot are only treated as citations
+# when they are a well-known extensionless file name. Anything else ("step:3",
+# "10:30") is prose, not a citation.
+is_bare_name() {
+  case "$1" in
+    Makefile|GNUmakefile|Dockerfile|Containerfile|Gemfile|Rakefile|Procfile|Jenkinsfile|Vagrantfile|Brewfile|Podfile|Justfile|justfile|Taskfile|BUILD|WORKSPACE|LICENSE|NOTICE|CODEOWNERS|OWNERS) return 0 ;;
+  esac
+  return 1
+}
+
+# Collapse . and .. so a cited path can be looked up. Prints ESCAPE if the
+# path climbs above its root.
+normalize() {
+  printf '%s\n' "$1" | awk -F/ '{
+    n = 0
+    for (i = 1; i <= NF; i++) {
+      if ($i == "" || $i == ".") continue
+      if ($i == "..") { if (n == 0) { print "ESCAPE"; exit } n--; continue }
+      a[++n] = $i
+    }
+    s = ""
+    for (i = 1; i <= n; i++) s = s (i > 1 ? "/" : "") a[i]
+    print s
+  }'
+}
+
+total_files=0
+if [ ${#NOTES[@]} -gt 0 ]; then
+for nf in "${NOTES[@]}"; do
+  total_files=$((total_files + 1))
+  count=0
+  # grep -o prints each match on its own line, prefixed by the line number.
+  while IFS= read -r hit; do
+    nline="${hit%%:*}"
+    m="${hit#*:}"
+    # Drop the one leading boundary character, if the match has one.
+    case "$m" in
+      [A-Za-z0-9_./@+-]*) ;;
+      *) m="${m#?}" ;;
+    esac
+    path="${m%%:*}"
+    rest="${m#*:}"
+    start="${rest%%-*}"
+    case "$rest" in *-*) end="${rest#*-}" ;; *) end="$start" ;; esac
+
+    case "$path" in
+      */*|*.*) ;;
+      *) is_bare_name "$path" || continue ;;
+    esac
+    # Version numbers, IP addresses, and ratios such as 1.5:1 are not paths.
+    case "$path" in *[!0-9.]*) ;; *) continue ;; esac
+    # A trailing dot is sentence punctuation, e.g. "see db.py:4." is fine but
+    # "e.g.:" never reaches here because it has no line number.
+
+    pre=""
+    case "$path" in
+      /*) pre="fail:absolute path; citations must be relative to the target" ;;
+    esac
+    norm=""
+    if [ -z "$pre" ]; then
+      norm="$(normalize "$path")"
+      case "$norm" in
+        .interrogate/*) pre="skip:cites the notes, not the code" ;;
+        ESCAPE) pre="fail:path climbs above the target" ;;
+      esac
+    fi
+    if [ -z "$pre" ] && [ "$MODE" = "commit" ]; then
+      norm="$(normalize "$PREFIX$path")"
+      [ "$norm" = "ESCAPE" ] && pre="fail:path climbs above the repository root"
+    fi
+    count=$((count + 1))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$nf" "$nline" "$m" "$norm" "$start" "$end" "$pre" >> "$W/cites"
+  done < <(grep -noE "$RE" "$nf" || true)
+  printf '%s\t%s\t%s\n' "$nf" "$(sha256_file "$nf")" "$count" >> "$W/files"
+done
+fi
+
+# Resolve each distinct path once: kind (file, dir, missing) and line count.
+: > "$W/resolved"
+awk -F'\t' '$7 == "" { print $4 }' "$W/cites" | sort -u | while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if [ "$MODE" = "commit" ]; then
+    kind="$(git cat-file -t "$COMMIT:$p" 2>/dev/null || true)"
+    case "$kind" in
+      blob) printf '%s\tfile\t%s\n' "$p" "$(git cat-file -p "$COMMIT:$p" | awk 'END { print NR }')" ;;
+      tree) printf '%s\tdir\t0\n' "$p" ;;
+      *)    printf '%s\tmissing\t0\n' "$p" ;;
+    esac
+  else
+    if [ -f "$p" ]; then printf '%s\tfile\t%s\n' "$p" "$(awk 'END { print NR }' "$p")"
+    elif [ -d "$p" ]; then printf '%s\tdir\t0\n' "$p"
+    else printf '%s\tmissing\t0\n' "$p"
+    fi
+  fi
+done > "$W/resolved"
+
+if [ "$MODE" = "commit" ]; then where="commit ${COMMIT:0:12}"; else where="the working tree"; fi
+
+# Join citations with their resolution and decide pass, fail, or skip.
+awk -F'\t' -v OFS='\t' -v where="$where" '
+  NR == FNR { kind[$1] = $2; lines[$1] = $3; next }
+  {
+    status = "pass"; reason = ""
+    if ($7 != "") {
+      split($7, pr, ":"); status = pr[1]; reason = substr($7, length(pr[1]) + 2)
+    } else if (kind[$4] == "missing") {
+      status = "fail"; reason = "file missing at " where
+    } else if (kind[$4] == "dir") {
+      status = "fail"; reason = "is a directory, not a file"
+    } else if ($5 + 0 < 1) {
+      status = "fail"; reason = "line numbers start at 1"
+    } else if ($6 + 0 < $5 + 0) {
+      status = "fail"; reason = "range is reversed"
+    } else if ($6 + 0 > lines[$4] + 0) {
+      status = "fail"; reason = "line " $6 " out of range (file has " lines[$4] " lines)"
+    }
+    print $1, $2, $3, $4, $5, $6, status, reason
+  }' "$W/resolved" "$W/cites" > "$W/results"
+
+report="$(
+  jq -n \
+    --rawfile results "$W/results" \
+    --rawfile files "$W/files" \
+    --arg mode "$MODE" --arg commit "$COMMIT" --arg prefix "$PREFIX" \
+    --arg at "$(now_utc)" '
+    def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+    (rows($results) | map({
+        notes_file: .[0], notes_line: (.[1] | tonumber), citation: .[2],
+        path: (if .[3] == "" then null else .[3] end),
+        start: (.[4] | tonumber), end: (.[5] | tonumber),
+        status: .[6], reason: (if .[7] == "" then null else .[7] end)
+      })) as $c
+    | {
+        schema_version: 1,
+        generated_by: "bin/check-citations",
+        generated_at: $at,
+        resolved_against: (if $mode == "commit"
+          then {kind: "git-commit", commit: $commit, repo_prefix: $prefix}
+          else {kind: "working-tree"} end),
+        meaning: "pass means the cited file exists and the cited lines are within it. It does not mean the lines support the claim; that needs a human reviewer.",
+        summary: {
+          citations: ($c | length),
+          passed: ($c | map(select(.status == "pass")) | length),
+          failed: ($c | map(select(.status == "fail")) | length),
+          skipped: ($c | map(select(.status == "skip")) | length)
+        },
+        files: (rows($files) | map({path: .[0], sha256: .[1], citations: (.[2] | tonumber)})),
+        citations: $c
+      }'
+)"
+
+if [ "$OUT" = "-" ]; then
+  printf '%s\n' "$report"
+else
+  mkdir -p "$(dirname "$OUT")"
+  printf '%s\n' "$report" | write_atomic "$OUT"
+fi
+
+failed="$(printf '%s' "$report" | jq '.summary.failed')"
+# The human summary goes to stderr when the report itself goes to stdout.
+if [ "$OUT" = "-" ]; then exec 3>&2; else exec 3>&1; fi
+{
+printf '%s' "$report" | jq -r --arg where "$where" '
+  "citations: \(.summary.citations) found in \(.files | length) file(s), \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped (resolved against \($where))"'
+printf '%s' "$report" | jq -r '.citations[] | select(.status == "fail") | "  FAIL \(.notes_file):\(.notes_line)  \(.citation)  \(.reason)"'
+if [ "$QUIET" -eq 0 ]; then
+  printf '%s' "$report" | jq -r '.files[] | select(.citations == 0) | "  note: no citations found in \(.path)"'
+fi
+} >&3
+
+[ "$failed" -eq 0 ] || exit 1
+exit 0
