@@ -30,6 +30,7 @@ Then answer each of these with evidence. For each one, say where it happens, and
 
 ## Rules
 
+- Every number is either **measured** or **estimated**. A measured number cites the row it came from in `.interrogate/metrics/` (for example `.interrogate/metrics/churn.tsv:12`); those files are produced by the runner at the assessed commit, and you must not edit them. An estimated number says how you estimated it. If the metrics directory doesn't exist (an interactive session, or a target with no git history), every number is estimated: say so.
 - Change nothing except files under `.interrogate/`.
 - Every hop and every answer cites `path:line`. "Absent" is a finding; cite where you looked.
 - Trace the code that runs, not the code the docs describe. Follow the actual calls.

@@ -32,11 +32,21 @@ With no notes files given, checks every .interrogate/*.md.
 Options:
   --commit SHA      Resolve against this commit instead.
   --worktree        Resolve against the working tree, even in a git repository.
+  --dir DIR         Notes directory, relative to target-dir (default .interrogate).
   --include FILE    Also check FILE (repeatable), e.g. ARCHITECTURE.md.
   --out FILE        Where to write the report (default .interrogate/citations.json,
                     relative to target-dir). Use - for stdout.
   -q, --quiet       Print only the summary line and failures.
   -h, --help        Show this help.
+
+Citations of the measurements, <dir>/metrics/<file>:<row>, resolve against
+those files, where row 1 is the header line. The short forms
+metrics/<file>:<row> and <file>:<row> (for the metrics file names) are
+accepted when no file by that name exists in the code.
+
+Notes files that contain a findings index (a "<!-- findings-index: KIND -->"
+line followed by a table) are also checked: the table must have the expected
+header and valid values. 02-patterns.md and 05-hotspots.md must have one.
 
 A pass means the file and lines exist. It does not mean they support the
 claim made about them.
@@ -45,7 +55,8 @@ EOF
 
 COMMIT=""
 WORKTREE=0
-OUT=".interrogate/citations.json"
+DIR=".interrogate"
+OUT=""
 QUIET=0
 TARGET=""
 NOTES=()
@@ -55,6 +66,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --commit)   COMMIT="${2:?--commit needs a value}"; shift 2 ;;
     --worktree) WORKTREE=1; shift ;;
+    --dir)      DIR="${2:?--dir needs a value}"; DIR="${DIR%/}"; shift 2 ;;
     --include)  INCLUDES+=("${2:?--include needs a value}"); shift 2 ;;
     --out)      OUT="${2:?--out needs a value}"; shift 2 ;;
     -q|--quiet) QUIET=1; shift ;;
@@ -68,6 +80,7 @@ need_jq "$SELF"
 TARGET="${TARGET:-.}"
 [ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
 cd "$TARGET"
+OUT="${OUT:-$DIR/citations.json}"
 
 IN_GIT=0
 PREFIX=""
@@ -79,8 +92,8 @@ fi
 # Decide what to resolve against.
 MODE="worktree"
 if [ "$WORKTREE" -eq 0 ] && [ "$IN_GIT" -eq 1 ]; then
-  if [ -z "$COMMIT" ] && [ -f .interrogate/run.json ]; then
-    COMMIT="$(jq -r '.target.commit // empty' .interrogate/run.json 2>/dev/null || true)"
+  if [ -z "$COMMIT" ] && [ -f "$DIR/run.json" ]; then
+    COMMIT="$(jq -r '.target.commit // empty' "$DIR/run.json" 2>/dev/null || true)"
   fi
   if [ -z "$COMMIT" ]; then
     COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
@@ -92,9 +105,9 @@ if [ "$WORKTREE" -eq 0 ] && [ "$IN_GIT" -eq 1 ]; then
   fi
 fi
 
-# Default notes set: every Markdown file the steps write under .interrogate/.
+# Default notes set: every Markdown file the steps write in the notes directory.
 if [ ${#NOTES[@]} -eq 0 ]; then
-  for f in .interrogate/*.md; do
+  for f in "$DIR"/*.md; do
     [ -f "$f" ] && NOTES+=("$f")
   done
 fi
@@ -141,6 +154,14 @@ normalize() {
   }'
 }
 
+exists_in_code() {
+  if [ "$MODE" = "commit" ]; then
+    git cat-file -e "$COMMIT:$PREFIX$1" 2>/dev/null
+  else
+    [ -e "$1" ]
+  fi
+}
+
 total_files=0
 if [ ${#NOTES[@]} -gt 0 ]; then
 for nf in "${NOTES[@]}"; do
@@ -176,12 +197,31 @@ for nf in "${NOTES[@]}"; do
     norm=""
     if [ -z "$pre" ]; then
       norm="$(normalize "$path")"
+      # Models often shorten a metrics citation to metrics/churn.tsv:12 or
+      # churn.tsv:12. Treat those as this run's metrics, but only when no
+      # file by that name exists in the code, so a real file always wins.
       case "$norm" in
-        .interrogate/*) pre="skip:cites the notes, not the code" ;;
+        metrics/*|.interrogate/metrics/*|files.tsv|churn.tsv|cochange.tsv|imports.tsv|fanin.tsv|enforcement.tsv|summary.json)
+          mbase="${norm##*/}"
+          if [ "$norm" != "$DIR/metrics/$mbase" ] && [ -f "$DIR/metrics/$mbase" ] && ! exists_in_code "$norm"; then
+            norm="$DIR/metrics/$mbase"
+          fi ;;
+        # The same shortening for the notes: 01-orient.md:46 is this run's
+        # notes, which are skipped below because a note is not evidence.
+        0[1-6]-*.md|issues.md|CLAUDE.proposed.md|ARCHITECTURE.proposed.md)
+          if [ -f "$DIR/$norm" ] && ! exists_in_code "$norm"; then norm="$DIR/$norm"; fi ;;
+      esac
+      case "$norm" in
+        "$DIR"/metrics/*) pre="metric" ;;
+        "$DIR"/*|.interrogate/*) pre="skip:cites the notes, not the code" ;;
         ESCAPE) pre="fail:path climbs above the target" ;;
       esac
     fi
-    if [ -z "$pre" ] && [ "$MODE" = "commit" ]; then
+    # Measurements live in the notes directory, not in the commit, so they
+    # resolve against the working tree; --verify checks they are unchanged.
+    if [ "$pre" = "metric" ]; then
+      pre=""
+    elif [ -z "$pre" ] && [ "$MODE" = "commit" ]; then
       norm="$(normalize "$PREFIX$path")"
       [ "$norm" = "ESCAPE" ] && pre="fail:path climbs above the repository root"
     fi
@@ -196,6 +236,12 @@ fi
 : > "$W/resolved"
 awk -F'\t' '$7 == "" { print $4 }' "$W/cites" | sort -u | while IFS= read -r p; do
   [ -n "$p" ] || continue
+  case "$p" in
+    "$DIR"/metrics/*)
+      if [ -f "$p" ]; then printf '%s\tfile\t%s\n' "$p" "$(awk 'END { print NR }' "$p")"
+      else printf '%s\tmissing\t0\n' "$p"; fi
+      continue ;;
+  esac
   if [ "$MODE" = "commit" ]; then
     kind="$(git cat-file -t "$COMMIT:$p" 2>/dev/null || true)"
     case "$kind" in
@@ -212,6 +258,80 @@ awk -F'\t' '$7 == "" { print $4 }' "$W/cites" | sort -u | while IFS= read -r p; 
 done > "$W/resolved"
 
 if [ "$MODE" = "commit" ]; then where="commit ${COMMIT:0:12}"; else where="the working tree"; fi
+
+# ---------------------------------------------------------------------------
+# Findings indexes. A fixed-format table that lets runs be compared without
+# a model. Kinds and their columns:
+#   patterns: pattern | scope | status (Enforced or Aspirational) | violations
+#   hotspots: rank | path | fanin | churn_window | measured (yes, no, partial)
+# Output: one IDX line per index (ok or an error), one ROW line per row.
+# ---------------------------------------------------------------------------
+: > "$W/index"
+if [ ${#NOTES[@]} -gt 0 ]; then
+for nf in "${NOTES[@]}"; do
+  awk -v nf="$nf" '
+    function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
+    function cells(line, out,   n, i, parts) {
+      line = trim(line); sub(/^\|/, "", line); sub(/\|$/, "", line)
+      n = split(line, parts, "|")
+      for (i = 1; i <= n; i++) { out[i] = trim(parts[i]); gsub(/`/, "", out[i]) }
+      return n
+    }
+    function fail(msg) { print "IDX\t" nf "\t" kind "\tfail\t" start "\t" msg; bad = 1 }
+    function finish() {
+      if (kind == "") return
+      if (!bad && state < 3) fail("the table after the marker is missing or incomplete")
+      if (!bad && rows == 0) fail("the table has no rows")
+      if (!bad) print "IDX\t" nf "\t" kind "\tok\t" start "\t" rows " rows"
+      found[kind] = 1; kind = ""
+    }
+    /<!--[ \t]*findings-index:/ {
+      finish()
+      kind = $0; sub(/.*findings-index:[ \t]*/, "", kind); sub(/[ \t]*-->.*/, "", kind)
+      start = FNR; state = 0; rows = 0; bad = 0
+      if (kind == "patterns") want = "pattern|scope|status|violations"
+      else if (kind == "hotspots") want = "rank|path|fanin|churn_window|measured"
+      else { fail("unknown index kind \"" kind "\" (expected patterns or hotspots)"); kind = "" }
+      next
+    }
+    kind != "" && state == 0 && /^[ \t]*$/ { next }
+    kind != "" && state == 0 {
+      n = cells($0, c); h = ""
+      for (i = 1; i <= n; i++) h = h (i > 1 ? "|" : "") tolower(c[i])
+      if (h != want) { fail("header is \"" h "\", expected \"" want "\""); kind = ""; next }
+      ncol = n; state = 1; next
+    }
+    kind != "" && state == 1 { if ($0 !~ /^[ \t]*\|[ \t:|-]+\|?[ \t]*$/) { fail("line " FNR ": expected the |---| separator row") ; kind = ""; next } state = 3; next }
+    kind != "" && state == 3 && $0 !~ /^[ \t]*\|/ { finish(); next }
+    kind != "" && state == 3 {
+      n = cells($0, c)
+      if (n != ncol) { fail("line " FNR ": " n " columns, expected " ncol); next }
+      rows++
+      if (kind == "patterns") {
+        if (c[1] == "") fail("line " FNR ": pattern name is empty")
+        if (c[3] != "Enforced" && c[3] != "Aspirational") fail("line " FNR ": status \"" c[3] "\" must be Enforced or Aspirational")
+        if (c[4] !~ /^[0-9]+$/) fail("line " FNR ": violations \"" c[4] "\" must be a whole number")
+      } else {
+        if (c[1] != rows) fail("line " FNR ": rank \"" c[1] "\", expected " rows)
+        if (c[2] == "") fail("line " FNR ": path is empty")
+        if (c[3] !~ /^([0-9]+|-)$/) fail("line " FNR ": fanin \"" c[3] "\" must be a whole number or -")
+        if (c[4] !~ /^([0-9]+|-)$/) fail("line " FNR ": churn_window \"" c[4] "\" must be a whole number or -")
+        if (c[5] != "yes" && c[5] != "no" && c[5] != "partial") fail("line " FNR ": measured \"" c[5] "\" must be yes, no, or partial")
+      }
+      row = "ROW\t" nf "\t" kind
+      for (i = 1; i <= n; i++) row = row "\t" c[i]
+      print row
+      next
+    }
+    END {
+      finish()
+      b = nf; sub(/.*\//, "", b)
+      if (b == "02-patterns.md" && !("patterns" in found)) { kind = "patterns"; start = 0; print "IDX\t" nf "\tpatterns\tfail\t0\tno findings index: the patterns notes must end with <!-- findings-index: patterns --> and its table" }
+      if (b == "05-hotspots.md" && !("hotspots" in found)) { print "IDX\t" nf "\thotspots\tfail\t0\tno findings index: the hotspots notes must end with <!-- findings-index: hotspots --> and its table" }
+    }
+  ' "$nf" >> "$W/index"
+done
+fi
 
 # Join citations with their resolution and decide pass, fail, or skip.
 awk -F'\t' -v OFS='\t' -v where="$where" '
@@ -238,6 +358,7 @@ report="$(
   jq -n \
     --rawfile results "$W/results" \
     --rawfile files "$W/files" \
+    --rawfile index "$W/index" \
     --arg mode "$MODE" --arg commit "$COMMIT" --arg prefix "$PREFIX" \
     --arg at "$(now_utc)" '
     def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
@@ -262,8 +383,18 @@ report="$(
           skipped: ($c | map(select(.status == "skip")) | length)
         },
         files: (rows($files) | map({path: .[0], sha256: .[1], citations: (.[2] | tonumber)})),
-        citations: $c
-      }'
+        citations: $c,
+        indexes: (rows($index) as $r
+          | ($r | map(select(.[0] == "IDX")) | group_by(.[1] + "\u0000" + .[2])
+             | map({notes_file: .[0][1], kind: .[0][2], line: (.[0][4] | tonumber),
+                    status: (if any(.[]; .[3] == "fail") then "fail" else "pass" end),
+                    errors: map(select(.[3] == "fail") | .[5])}))
+          | map(. as $i | . + {rows: ($r | map(select(.[0] == "ROW" and .[1] == $i.notes_file and .[2] == $i.kind) | .[3:])
+              | map(if $i.kind == "patterns"
+                    then {pattern: .[0], scope: .[1], status: .[2], violations: (.[3] | tonumber? // .[3])}
+                    else {rank: (.[0] | tonumber? // .[0]), path: .[1], fanin: .[2], churn_window: .[3], measured: .[4]} end))}))
+      }
+      | .summary.index_failures = (.indexes | map(select(.status == "fail")) | length)'
 )"
 
 if [ "$OUT" = "-" ]; then
@@ -273,13 +404,14 @@ else
   printf '%s\n' "$report" | write_atomic "$OUT"
 fi
 
-failed="$(printf '%s' "$report" | jq '.summary.failed')"
+failed="$(printf '%s' "$report" | jq '.summary.failed + .summary.index_failures')"
 # The human summary goes to stderr when the report itself goes to stdout.
 if [ "$OUT" = "-" ]; then exec 3>&2; else exec 3>&1; fi
 {
 printf '%s' "$report" | jq -r --arg where "$where" '
   "citations: \(.summary.citations) found in \(.files | length) file(s), \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped (resolved against \($where))"'
 printf '%s' "$report" | jq -r '.citations[] | select(.status == "fail") | "  FAIL \(.notes_file):\(.notes_line)  \(.citation)  \(.reason)"'
+printf '%s' "$report" | jq -r '.indexes[] | if .status == "fail" then (.errors[] as $e | "  FAIL \(.notes_file):\(.line)  findings index (\(.kind))  \($e)") else "  findings index (\(.kind)) in \(.notes_file): \(.rows | length) rows, valid" end'
 if [ "$QUIET" -eq 0 ]; then
   printf '%s' "$report" | jq -r '.files[] | select(.citations == 0) | "  note: no citations found in \(.path)"'
 fi

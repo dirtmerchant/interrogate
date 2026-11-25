@@ -44,14 +44,20 @@ Options:
   --trust-project    Load the target's own Claude Code settings, hooks, and
                      MCP servers. Off by default: use it only for repositories
                      you trust.
-  --model name       Model to request for every step. run.json records the
-                     model each step actually ran on.
+  --model name       Model to request for every step. Use a full model ID
+                     (not an alias like opus) for repeatable runs. run.json
+                     records the model each step actually ran on.
+  --effort level     Effort level for every step: low, medium, high, xhigh,
+                     or max. Pin it for repeatable runs.
   --allow-dirty      Run even though the target has uncommitted changes.
                      Citations still resolve against the committed HEAD.
   --require-provider name
                      Refuse to start unless the model provider is this one:
                      anthropic, bedrock, google-cloud, foundry, or other.
   --no-verify        Don't run check-citations after each step.
+  --run-dir dir      Write notes, metrics, and run.json to dir (relative to
+                     target-dir, default .interrogate) instead. Use one per
+                     run to compare runs with bin/compare-runs.
   --trust-notes      Accept notes files that are tracked in the target's git
                      history as completed steps. Without it the run refuses,
                      because a committed notes file may not come from a run.
@@ -83,12 +89,14 @@ FORCE=0
 COMMIT=0
 TRUST=0
 MODEL=""
+EFFORT=""
 DRY=0
 ALLOW_DIRTY=0
 REQUIRE_PROVIDER=""
 NO_VERIFY=0
 TRUST_NOTES=0
 VERIFY=0
+OUT=".interrogate"
 TARGET=""
 
 while [ $# -gt 0 ]; do
@@ -99,12 +107,14 @@ while [ $# -gt 0 ]; do
     --commit)           COMMIT=1; shift ;;
     --trust-project)    TRUST=1; shift ;;
     --model)            MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --effort)           EFFORT="${2:?--effort needs a value}"; shift 2 ;;
     --allow-dirty)      ALLOW_DIRTY=1; shift ;;
     --require-provider) REQUIRE_PROVIDER="${2:?--require-provider needs a value}"; shift 2 ;;
     --no-verify)        NO_VERIFY=1; shift ;;
     --trust-notes)      TRUST_NOTES=1; shift ;;
     --dry-run)          DRY=1; shift ;;
     --verify)           VERIFY=1; shift ;;
+    --run-dir)          OUT="${2:?--run-dir needs a value}"; shift 2 ;;
     -h|--help)          usage; exit 0 ;;
     -*)                 echo "$SELF: unknown option $1" >&2; usage >&2; exit 2 ;;
     *)                  if [ -n "$TARGET" ]; then echo "$SELF: only one target directory" >&2; exit 2; fi
@@ -116,6 +126,20 @@ for step in $STEPS; do
   note_for "$step" >/dev/null || { echo "$SELF: unknown step '$step'" >&2; exit 2; }
 done
 
+case "$EFFORT" in
+  ""|low|medium|high|xhigh|max) ;;
+  *) echo "$SELF: --effort must be low, medium, high, xhigh, or max" >&2; exit 2 ;;
+esac
+
+# An alias such as opus or sonnet resolves to whatever model is newest at the
+# time, so two runs a month apart may use different models.
+MODEL_IS_ALIAS=false
+case "$MODEL" in
+  "") ;;
+  *[!a-z\[\]0-9]*) ;;
+  *) MODEL_IS_ALIAS=true ;;
+esac
+
 case "$REQUIRE_PROVIDER" in
   ""|anthropic|bedrock|google-cloud|foundry|other) ;;
   vertex) REQUIRE_PROVIDER="google-cloud" ;;
@@ -124,12 +148,22 @@ esac
 
 need_jq "$SELF"
 
+# The notes directory must be a plain relative path inside the target: the
+# permission rules anchor it at the target root, and the dirty check and
+# resume rules exclude it by name.
+OUT="${OUT%/}"
+case "$OUT" in
+  ""|.|/*|..|../*|*/../*|*/..) echo "$SELF: --run-dir must be a relative path inside the target, such as .interrogate/runs/a" >&2; exit 2 ;;
+esac
+case "$OUT" in *[!A-Za-z0-9._/-]*) echo "$SELF: --run-dir may contain only letters, digits, '.', '_', '-', and '/'" >&2; exit 2 ;; esac
+OUT_RE="$(printf '%s' "$OUT" | sed 's/[.]/\\./g')"
+
 TARGET="${TARGET:-.}"
 [ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
 cd "$TARGET"
 TARGET_ABS="$(pwd -P)"
-RUN_JSON=".interrogate/run.json"
-CIT_JSON=".interrogate/citations.json"
+RUN_JSON="$OUT/run.json"
+CIT_JSON="$OUT/citations.json"
 
 # ---------------------------------------------------------------------------
 # --verify: recompute the hash of every file run.json recorded and report any
@@ -162,8 +196,9 @@ do_verify() {
       reduce ($s.outputs // [])[] as $o (.;
         if $s.status == "adopted" and has($o.path) then . else .[$o.path] = $o.sha256 end)))
     + (if .architecture_md.sha256 then {"ARCHITECTURE.md": .architecture_md.sha256} else {} end)
-    + (if (.citation_checks | length) > 0 then {".interrogate/citations.json": .citation_checks[-1].citations_json_sha256} else {} end)
-    | to_entries[] | "\(.key)\t\(.value)"' "$RUN_JSON")"
+    + ((.measurements.outputs // []) | map({(.path): .sha256}) | add // {})
+    + (if (.citation_checks | length) > 0 then {($cit): .citation_checks[-1].citations_json_sha256} else {} end)
+    | to_entries[] | "\(.key)\t\(.value)"' --arg cit "$CIT_JSON" "$RUN_JSON")"
 
   while IFS='	' read -r path want; do
     [ -n "$path" ] || continue
@@ -524,6 +559,10 @@ if [ -n "$REQUIRE_PROVIDER" ]; then
   echo "   matches --require-provider $REQUIRE_PROVIDER"
 fi
 
+if [ "$MODEL_IS_ALIAS" = "true" ]; then
+  echo "== note: --model $MODEL is an alias. It resolves to whichever model is current, so a later run may use a different one. Pass a full model ID for repeatable runs; run.json records the model actually used either way."
+fi
+
 CLAUDE_VERSION="unknown"
 if [ "$DRY" -eq 0 ]; then
   command -v claude >/dev/null || DIE_STATUS=127 die "the claude CLI is not on PATH"
@@ -549,7 +588,7 @@ fi
 RESUME=0
 if [ -f "$RUN_JSON" ]; then
   jq -e --argjson v "$SCHEMA_VERSION" '.schema_version == $v' "$RUN_JSON" >/dev/null 2>&1 \
-    || die "$RUN_JSON is not a schema_version $SCHEMA_VERSION run record. Move .interrogate/ aside to start a new assessment."
+    || die "$RUN_JSON is not a schema_version $SCHEMA_VERSION run record. Move $OUT/ aside to start a new assessment."
   RESUME=1
   rec_git="$(jq -r '.target.is_git' "$RUN_JSON")"
   rec_commit="$(jq -r '.target.commit // empty' "$RUN_JSON")"
@@ -557,7 +596,7 @@ if [ -f "$RUN_JSON" ]; then
     die "$RUN_JSON records a git target, but $TARGET_ABS is no longer a git repository."
   fi
   if [ "$rec_git" = "false" ] && [ "$IN_GIT" -eq 1 ]; then
-    die "$RUN_JSON records a non-git target, but $TARGET_ABS is now a git repository. Move .interrogate/ aside to start a new assessment pinned to a commit."
+    die "$RUN_JSON records a non-git target, but $TARGET_ABS is now a git repository. Move $OUT/ aside to start a new assessment pinned to a commit."
   fi
   if [ "$IN_GIT" -eq 1 ] && [ "$HEAD_SHA" != "$rec_commit" ]; then
     # --commit moves HEAD with the runner's own commits. Allow exactly that:
@@ -567,15 +606,15 @@ if [ -f "$RUN_JSON" ]; then
     if git merge-base --is-ancestor "$rec_commit" "$HEAD_SHA" 2>/dev/null; then
       for c in $(git rev-list "$rec_commit..$HEAD_SHA"); do
         jq -e --arg c "$c" '(.runner_commits // []) | index($c) != null' "$RUN_JSON" >/dev/null || { ok=0; break; }
-        if git diff-tree --no-commit-id --name-only -r "$c" | grep -v -e "^${PREFIX}\.interrogate/" -e "^${PREFIX}ARCHITECTURE\.md\$" >/dev/null; then ok=0; break; fi
+        if git diff-tree --no-commit-id --name-only -r "$c" | grep -v -e "^${PREFIX}${OUT_RE}/" -e "^${PREFIX}ARCHITECTURE\.md\$" >/dev/null; then ok=0; break; fi
       done
     else
       ok=0
     fi
     if [ "$ok" -eq 0 ]; then
-      die "HEAD is now ${HEAD_SHA:0:12}, but the notes in .interrogate/ were written against ${rec_commit:0:12} (run.json). Resuming would mix findings from two revisions.
+      die "HEAD is now ${HEAD_SHA:0:12}, but the notes in $OUT/ were written against ${rec_commit:0:12} (run.json). Resuming would mix findings from two revisions.
   To continue the existing assessment: git checkout ${rec_commit:0:12}
-  To assess the new revision: move .interrogate/ aside and run again."
+  To assess the new revision: move $OUT/ aside and run again."
     fi
   fi
 fi
@@ -584,7 +623,8 @@ fi
 DIRTY=0
 DIRTY_PATHS='[]'
 if [ "$IN_GIT" -eq 1 ]; then
-  excl=(":(top,exclude)${PREFIX}.interrogate")
+  # Every notes directory is excluded: the default one and this run's.
+  excl=(":(top,exclude)${PREFIX}.interrogate" ":(top,exclude)${PREFIX}$OUT")
   if [ "$RESUME" -eq 1 ] && jq -e '.architecture_md.written_by_run == true' "$RUN_JSON" >/dev/null 2>&1; then
     excl+=(":(top,exclude)${PREFIX}ARCHITECTURE.md")
   fi
@@ -624,15 +664,15 @@ in_steps() { case " $STEPS " in *" $1 "*) return 0 ;; esac; return 1; }
 PLANTED=""
 PLANTED_JSON='{}'
 if [ "$IN_GIT" -eq 1 ]; then
-  for f in $(for s in $ALL_STEPS; do echo ".interrogate/$(note_for "$s")"; done) \
-           .interrogate/CLAUDE.proposed.md .interrogate/ARCHITECTURE.proposed.md "$RUN_JSON" "$CIT_JSON"; do
+  for f in $(for s in $ALL_STEPS; do echo "$OUT/$(note_for "$s")"; done) \
+           "$OUT/CLAUDE.proposed.md" "$OUT/ARCHITECTURE.proposed.md" "$RUN_JSON" "$CIT_JSON"; do
     [ -e "$f" ] || continue
     fc="$(foreign_commits "$f")"
     [ -n "$fc" ] || continue
     # A notes file that this run will overwrite with --force is not trusted
     # either way, so it doesn't block.
     for s in $ALL_STEPS; do
-      if [ "$f" = ".interrogate/$(note_for "$s")" ] && [ "$FORCE" -eq 1 ] && in_steps "$s"; then fc=""; fi
+      if [ "$f" = "$OUT/$(note_for "$s")" ] && [ "$FORCE" -eq 1 ] && in_steps "$s"; then fc=""; fi
     done
     [ -n "$fc" ] || continue
     nfc="$(printf '%s\n' "$fc" | wc -l | tr -d ' ')"
@@ -678,9 +718,10 @@ fi
 # write files. Claude Code decides what is read-only, and the version is
 # recorded in run.json; if a later version stops treating one of these as
 # read-only, dontAsk denies it and the step works with less history.
-BASE_ALLOW='Edit(/.interrogate/**)'
+BASE_ALLOW="Edit(/$OUT/**)"
 # The runner's own records. A deny rule wins over the allow above.
-BASE_DENY='Edit(/.interrogate/run.json),Edit(/.interrogate/citations.json)'
+BASE_DENY="Edit(/$RUN_JSON),Edit(/$CIT_JSON),Edit(/$OUT/metrics/**)"
+METRICS="$OUT/metrics"
 
 # ---------------------------------------------------------------------------
 # Initialise or extend run.json.
@@ -709,7 +750,7 @@ ARCH_GRANT=$((1 - ARCH_PRESENT))
 
 INVOCATION=0
 if [ "$DRY" -eq 0 ]; then
-  mkdir -p .interrogate
+  mkdir -p "$OUT"
   PLUGIN_INFO="$(plugin_json)"
   invocation="$(jq -c -n \
     --arg at "$(now_utc)" --arg ccv "$CLAUDE_VERSION" --argjson plugin "$PLUGIN_INFO" \
@@ -719,6 +760,7 @@ if [ "$DRY" -eq 0 ]; then
     --argjson no_verify "$NO_VERIFY" --argjson force "$FORCE" --argjson commit "$COMMIT" \
     --argjson trust_notes "$TRUST_NOTES" --argjson planted "$PLANTED_JSON" \
     --arg steps "$STEPS" --arg model "$MODEL" --arg feature "$FEATURE" --arg head "$HEAD_SHA" \
+    --arg effort "$EFFORT" --argjson alias "$MODEL_IS_ALIAS" --arg run_dir "$OUT" \
     --argjson dirty_paths "$DIRTY_PATHS" --argjson arch_present "$ARCH_PRESENT" --argjson arch_grant "$ARCH_GRANT" '
     def nz: if . == "" then null else . end;
     {
@@ -736,7 +778,8 @@ if [ "$DRY" -eq 0 ]; then
         steps: ($steps | split(" ") | map(select(length > 0))),
         force: ($force == 1), commit: ($commit == 1), trust_project: ($trust == 1),
         allow_dirty: ($allow_dirty == 1), no_verify: ($no_verify == 1), trust_notes: ($trust_notes == 1),
-        model_requested: ($model | nz), feature: ($feature | nz)
+        model_requested: ($model | nz), model_requested_is_alias: $alias,
+        effort_requested: ($effort | nz), feature: ($feature | nz), run_dir: $run_dir
       },
       target_state: {head: ($head | nz), dirty: ($dirty == 1), dirty_paths: $dirty_paths},
       notes_tracked_in_git: $planted,
@@ -778,19 +821,59 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/interrogate.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# Hash every file under .interrogate/ except the runner's own records.
+# Hash every file under the notes directory except the runner's own records.
 snapshot() {
   : > "$1"
-  [ -d .interrogate ] || return 0
-  find .interrogate -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
+  [ -d "$OUT" ] || return 0
+  find "$OUT" -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -path "$METRICS/*" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
     printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
   done > "$1"
+}
+
+# The metrics must be exactly what bin/measure wrote. A step that changed
+# them could make its own numbers agree with its findings.
+metrics_check() {
+  [ "$IN_GIT" -eq 1 ] || return 0
+  local path want
+  while IFS='	' read -r path want; do
+    [ -n "$path" ] || continue
+    if [ ! -f "$path" ] || [ "$(sha256_file "$path")" != "$want" ]; then
+      die "$path no longer matches what bin/measure wrote. Only the runner may write $METRICS/; stopping."
+    fi
+  done <<<"$(jq -r '(.measurements.outputs // [])[] | "\(.path)\t\(.sha256)"' "$RUN_JSON")"
+}
+
+# Measure the target at the pinned commit, once per run directory. On resume
+# the existing measurements are kept if they match run.json.
+run_measurements() {
+  if [ "$IN_GIT" -eq 0 ]; then
+    rj_write '.measurements = {skipped: "not a git repository: there is no commit to measure"}'
+    return 0
+  fi
+  local commit outputs
+  commit="$(jq -r '.target.commit' "$RUN_JSON")"
+  if jq -e --arg c "$commit" '.measurements.commit == $c' "$RUN_JSON" >/dev/null 2>&1; then
+    metrics_check
+    echo "== measurements: kept from earlier run ($METRICS/)"
+    return 0
+  fi
+  echo "== measuring the target at ${commit:0:12} (no model)"
+  "$PLUGIN_ROOT/bin/measure" --commit "$commit" --dir "$OUT" --out "$METRICS" . | sed 's/^/   /'
+  outputs="$(for f in "$METRICS"/*.tsv "$METRICS/summary.json"; do printf '%s\t%s\n' "$f" "$(sha256_file "$f")"; done \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {path: .[0], sha256: .[1]})')"
+  rj_write '$s[0] as $m | .measurements = {
+      at: $now, commit: $c, generated_by: "bin/measure", dir: $d, outputs: $o,
+      window: $m.window, history: $m.history, rows: $m.rows,
+      code_languages_not_measured: ($m.languages | to_entries
+        | map(select((.value.imports_measured | not) and ([.key] | inside(["docs", "config"]) | not)))
+        | map({language: .key, files: .value.files}))
+    }' --arg c "$commit" --arg d "$METRICS" --argjson o "$outputs" --slurpfile s "$METRICS/summary.json"
 }
 
 # Run check-citations and record the result. Returns its exit status.
 run_citation_check() {
   local scope="$1"; shift
-  local args=(--quiet --out "$CIT_JSON") rc
+  local args=(--quiet --dir "$OUT" --out "$CIT_JSON") rc
   if [ "$IN_GIT" -eq 1 ]; then
     args+=(--commit "$(jq -r '.target.commit' "$RUN_JSON")")
   else
@@ -851,7 +934,7 @@ adopt_note() {
 
 run_step() {
   step="$1"
-  note=".interrogate/$(note_for "$step")"
+  note="$OUT/$(note_for "$step")"
 
   if [ "$FORCE" -eq 0 ] && [ -s "$note" ]; then
     echo "== $step: $note exists, skipping (use --force to re-run)"
@@ -878,6 +961,21 @@ run_step() {
     --allowedTools "$allow" --disallowedTools "$deny" --output-format stream-json --verbose
   if [ "$TRUST" -eq 0 ]; then set -- "$@" --setting-sources user; fi
   if [ -n "$MODEL" ]; then set -- "$@" --model "$MODEL"; fi
+  if [ -n "$EFFORT" ]; then set -- "$@" --effort "$EFFORT"; fi
+  # Notes for the unattended session. These say how the run is set up; they
+  # don't change what the step assesses.
+  #  - dontAsk denies compound shell commands (loops, variables, $(...)),
+  #    and in early runs a single denial led the model to stop using Bash
+  #    for the whole step. Say up front what works.
+  #  - The exact form for citing a measurement, which check-citations checks.
+  #  - With --run-dir, where this run's notes are: the skills say .interrogate/.
+  sys="This is an unattended assessment run. Shell commands run without approval only when each Bash call is one simple read-only command, or a pipeline of them, such as git log, git show, ls, or grep. Loops, variable assignments, command substitution, and chained commands are denied, so run one simple command per call. Reading files with the Read tool always works."
+  sys="$sys Every code citation is the file's full path from the current working directory, then the line, such as app/store.py:3, never the bare file name: each citation is checked, and store.py:3 does not resolve."
+  sys="$sys Measurements of the assessed commit are in $OUT/metrics/. Cite a row of one as $OUT/metrics/<file>:<line>, for example $OUT/metrics/churn.tsv:12, where line 1 is the header."
+  if [ "$OUT" != ".interrogate" ]; then
+    sys="$sys For this run, the notes directory is $OUT/ (relative to the current working directory). Wherever the instructions say .interrogate/, read and write $OUT/ instead. Don't read or write notes anywhere else under .interrogate/."
+  fi
+  set -- "$@" --append-system-prompt "$sys"
 
   echo "== $step"
   if [ "$DRY" -eq 1 ]; then
@@ -887,6 +985,7 @@ run_step() {
 
   rj_check
   cit_check
+  metrics_check
   snapshot "$WORK/before"
   touch "$WORK/marker"
   arch_before=""
@@ -906,8 +1005,11 @@ run_step() {
   rc="${rcs[0]}"
   ended="$(now_utc)"
 
-  init="$(jq -cR 'fromjson? | select(.type == "system" and .subtype == "init")' "$WORK/$step.jsonl" | head -n1)"
-  result="$(jq -cR 'fromjson? | select(.type == "result")' "$WORK/$step.jsonl" | tail -n1)"
+  # Select inside jq, not with head: subagents emit their own init events,
+  # and head closing the pipe early would fail the step under pipefail.
+  # The session's own init event is the first one.
+  init="$(jq -cRn '[inputs | fromjson? | select(.type == "system" and .subtype == "init")] | first // empty' "$WORK/$step.jsonl")"
+  result="$(jq -cRn '[inputs | fromjson? | select(.type == "result")] | last // empty' "$WORK/$step.jsonl")"
   [ -n "$init" ] || init='{}'
   [ -n "$result" ] || result='{}'
 
@@ -915,14 +1017,15 @@ run_step() {
   jq -r '.result // "(no result text)"' <<<"$result"
   echo
 
-  # The model must not have touched the runner's records.
+  # The model must not have touched the runner's records or the metrics.
   rj_check
   cit_check
+  metrics_check
 
   # Files the step wrote: new, changed, or rewritten (newer than the marker).
   snapshot "$WORK/after"
   outputs="$(
-    { find .interrogate -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print 2>/dev/null
+    { find "$OUT" -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -path "$METRICS/*" ! -name '*.tmp.*' -print 2>/dev/null
       awk -F'\t' 'NR == FNR { b[$1] = $2; next } b[$1] != $2 { print $1 }' "$WORK/before" "$WORK/after"
     } | LC_ALL=C sort -u | while IFS= read -r f; do
       [ -f "$f" ] && printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
@@ -948,7 +1051,8 @@ run_step() {
     --argjson init "$init" --argjson result "$result" --arg model_req "$MODEL" \
     --arg skill "$(sha256_file "$PLUGIN_ROOT/skills/$step/SKILL.md")" \
     --arg allow "$allow" --arg deny "$deny" --argjson outputs "$outputs" \
-    --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" '
+    --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" \
+    --arg effort "$EFFORT" --arg sys "$sys" '
     def nz: if . == "" then null else . end;
     # jq'"'"'s // treats false as missing, so booleans are read with has().
     def field($o; $k; $d): if ($o | has($k)) then $o[$k] else $d end;
@@ -960,6 +1064,14 @@ run_step() {
       cost_usd: ($result.total_cost_usd // "unknown"),
       model_requested: ($model_req | nz),
       model: ($init.model // "unknown"),
+      effort_requested: ($effort | nz),
+      subagents_spawned: ($result.subagent_stats.spawned // "unknown"),
+      # Another model in modelUsage with no subagents may mean a fallback
+      # model answered. Small background calls can also cause this, hence
+      # "suspected".
+      other_models: ((($result.modelUsage // {}) | keys) - [$init.model // ""]),
+      model_fallback_suspected: (((($result.modelUsage // {}) | keys) - [$init.model // ""] | length) > 0
+                                 and (($result.subagent_stats.spawned // 0) == 0)),
       models_used: (($result.modelUsage // {}) | with_entries(.value |= {cost_usd: .costUSD, provider: (.provider // "unknown")})),
       provider_reported: $reported,
       provider_mismatch: $mismatch,
@@ -967,6 +1079,7 @@ run_step() {
       permission_denials: (($result.permission_denials // []) | map({tool: .tool_name, command: (.tool_input.command // .tool_input.file_path // null | if type == "string" then .[0:300] else . end)})),
       skill_sha256: $skill,
       allowed_tools: ($allow | split(",")),
+      appended_system_prompt: $sys,
       disallowed_tools: ($deny | split(",")),
       outputs: $outputs,
       architecture_md_sha256: ($arch | nz),
@@ -994,13 +1107,13 @@ run_step() {
     if run_citation_check "after $step"; then crc=0; else crc=1; fi
     rj_write '.steps[(.steps | length) - 1].citations = (.citation_checks[-1] | {citations, passed, failed, skipped, citations_json_sha256})'
     if [ "$crc" -ne 0 ]; then
-      die "citations in the notes don't resolve (listed above; details in $CIT_JSON). Stopping before the next step.
+      die "the notes have citations that don't resolve or a findings index that isn't valid (listed above; details in $CIT_JSON). Stopping before the next step.
   Fix the notes by hand, or re-run the step with --steps $step --force. --no-verify skips this check."
     fi
   fi
 
   if [ "$COMMIT" -eq 1 ]; then
-    git add -- .interrogate
+    git add -- "$OUT"
     if [ -f ARCHITECTURE.md ]; then git add -- ARCHITECTURE.md; fi
     if ! git diff --cached --quiet; then
       git commit -q -m "interrogate: $step"
@@ -1010,26 +1123,30 @@ run_step() {
   fi
 }
 
+if [ "$DRY" -eq 0 ]; then
+  run_measurements
+fi
+
 # Notes kept from an earlier invocation are checked once up front, because
 # later steps build on them and resume would otherwise skip straight past a
 # step whose citations failed.
 if [ "$DRY" -eq 0 ] && [ "$NO_VERIFY" -eq 0 ]; then
   keep=()
   for s in $ALL_STEPS; do
-    n=".interrogate/$(note_for "$s")"
+    n="$OUT/$(note_for "$s")"
     [ -s "$n" ] || continue
     if [ "$FORCE" -eq 1 ] && in_steps "$s"; then continue; fi
     keep+=("$n")
   done
   if ! { [ "$FORCE" -eq 1 ] && in_steps capture; }; then
-    for n in .interrogate/CLAUDE.proposed.md .interrogate/ARCHITECTURE.proposed.md; do
+    for n in "$OUT/CLAUDE.proposed.md" "$OUT/ARCHITECTURE.proposed.md"; do
       [ -s "$n" ] && keep+=("$n")
     done
   fi
   if [ ${#keep[@]} -gt 0 ]; then
     echo "== checking citations in the notes already present"
     run_citation_check "existing notes at start" "${keep[@]}" \
-      || die "existing notes have citations that don't resolve (listed above). Fix them, re-run those steps with --force, or pass --no-verify."
+      || die "existing notes have citations that don't resolve or an invalid findings index (listed above). Fix them, re-run those steps with --force, or pass --no-verify."
   fi
 fi
 
@@ -1039,7 +1156,7 @@ done
 
 if [ "$DRY" -eq 0 ]; then
   echo
-  echo "Notes are in $(pwd)/.interrogate/"
+  echo "Notes are in $(pwd)/$OUT/"
   echo "Run record: $(pwd)/$RUN_JSON"
   if [ -f ARCHITECTURE.md ]; then echo "Assessment: $(pwd)/ARCHITECTURE.md"; fi
 fi
