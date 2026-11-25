@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-labelledby="t d">
+<title id="t">interrogate</title><desc id="d">Seven-step, evidence-backed architecture assessment for Claude Code: orient, patterns, boundaries, trace, hotspots, critique, capture.</desc>
+<rect width="1280" height="340" rx="18" fill="#0d1117"/>
+<rect x="0.5" y="0.5" width="1279" height="339" rx="18" fill="none" stroke="#30363d"/>
+<text x="80" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="68" font-weight="700" fill="#e6edf3"><tspan fill="#f0b429">&gt; </tspan>interrogate</text>
+<text x="82" y="168" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="22" fill="#9da7b3">Seven questions for a codebase you have never seen. Every answer cites file:line.</text>
+<line x1="80" y1="258" x2="1200" y2="258" stroke="#30363d" stroke-width="2"/>
+<rect x="80" y="236" width="148" height="44" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="154.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#e6edf3"><tspan fill="#f0b429" font-weight="700">1</tspan> orient</text>
+<rect x="242" y="236" width="148" height="44" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="316.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#e6edf3"><tspan fill="#f0b429" font-weight="700">2</tspan> patterns</text>
+<rect x="404" y="236" width="148" height="44" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="478.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#e6edf3"><tspan fill="#f0b429" font-weight="700">3</tspan> boundaries</text>
+<rect x="566" y="236" width="148" height="44" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="640.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#e6edf3"><tspan fill="#f0b429" font-weight="700">4</tspan> trace</text>
+<rect x="728" y="236" width="148" height="44" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="802.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#e6edf3"><tspan fill="#f0b429" font-weight="700">5</tspan> hotspots</text>
+<rect x="890" y="236" width="148" height="44" rx="22" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+<text x="964.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#e6edf3"><tspan fill="#f0b429" font-weight="700">6</tspan> critique</text>
+<rect x="1052" y="236" width="148" height="44" rx="22" fill="#f0b429" stroke="#f0b429" stroke-width="1.5"/>
+<text x="1126.0" y="264" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#0d1117"><tspan fill="#0d1117" font-weight="700">7</tspan> capture</text>
+</svg>
