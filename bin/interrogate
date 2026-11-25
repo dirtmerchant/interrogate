@@ -44,8 +44,11 @@ Options:
   --trust-project    Load the target's own Claude Code settings, hooks, and
                      MCP servers. Off by default: use it only for repositories
                      you trust.
-  --model name       Model to request for every step. run.json records the
-                     model each step actually ran on.
+  --model name       Model to request for every step. Use a full model ID
+                     (not an alias like opus) for repeatable runs. run.json
+                     records the model each step actually ran on.
+  --effort level     Effort level for every step: low, medium, high, xhigh,
+                     or max. Pin it for repeatable runs.
   --allow-dirty      Run even though the target has uncommitted changes.
                      Citations still resolve against the committed HEAD.
   --require-provider name
@@ -86,6 +89,7 @@ FORCE=0
 COMMIT=0
 TRUST=0
 MODEL=""
+EFFORT=""
 DRY=0
 ALLOW_DIRTY=0
 REQUIRE_PROVIDER=""
@@ -103,6 +107,7 @@ while [ $# -gt 0 ]; do
     --commit)           COMMIT=1; shift ;;
     --trust-project)    TRUST=1; shift ;;
     --model)            MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --effort)           EFFORT="${2:?--effort needs a value}"; shift 2 ;;
     --allow-dirty)      ALLOW_DIRTY=1; shift ;;
     --require-provider) REQUIRE_PROVIDER="${2:?--require-provider needs a value}"; shift 2 ;;
     --no-verify)        NO_VERIFY=1; shift ;;
@@ -120,6 +125,20 @@ done
 for step in $STEPS; do
   note_for "$step" >/dev/null || { echo "$SELF: unknown step '$step'" >&2; exit 2; }
 done
+
+case "$EFFORT" in
+  ""|low|medium|high|xhigh|max) ;;
+  *) echo "$SELF: --effort must be low, medium, high, xhigh, or max" >&2; exit 2 ;;
+esac
+
+# An alias such as opus or sonnet resolves to whatever model is newest at the
+# time, so two runs a month apart may use different models.
+MODEL_IS_ALIAS=false
+case "$MODEL" in
+  "") ;;
+  *[!a-z\[\]0-9]*) ;;
+  *) MODEL_IS_ALIAS=true ;;
+esac
 
 case "$REQUIRE_PROVIDER" in
   ""|anthropic|bedrock|google-cloud|foundry|other) ;;
@@ -177,6 +196,7 @@ do_verify() {
       reduce ($s.outputs // [])[] as $o (.;
         if $s.status == "adopted" and has($o.path) then . else .[$o.path] = $o.sha256 end)))
     + (if .architecture_md.sha256 then {"ARCHITECTURE.md": .architecture_md.sha256} else {} end)
+    + ((.measurements.outputs // []) | map({(.path): .sha256}) | add // {})
     + (if (.citation_checks | length) > 0 then {($cit): .citation_checks[-1].citations_json_sha256} else {} end)
     | to_entries[] | "\(.key)\t\(.value)"' --arg cit "$CIT_JSON" "$RUN_JSON")"
 
@@ -539,6 +559,10 @@ if [ -n "$REQUIRE_PROVIDER" ]; then
   echo "   matches --require-provider $REQUIRE_PROVIDER"
 fi
 
+if [ "$MODEL_IS_ALIAS" = "true" ]; then
+  echo "== note: --model $MODEL is an alias. It resolves to whichever model is current, so a later run may use a different one. Pass a full model ID for repeatable runs; run.json records the model actually used either way."
+fi
+
 CLAUDE_VERSION="unknown"
 if [ "$DRY" -eq 0 ]; then
   command -v claude >/dev/null || DIE_STATUS=127 die "the claude CLI is not on PATH"
@@ -696,7 +720,8 @@ fi
 # read-only, dontAsk denies it and the step works with less history.
 BASE_ALLOW="Edit(/$OUT/**)"
 # The runner's own records. A deny rule wins over the allow above.
-BASE_DENY="Edit(/$RUN_JSON),Edit(/$CIT_JSON)"
+BASE_DENY="Edit(/$RUN_JSON),Edit(/$CIT_JSON),Edit(/$OUT/metrics/**)"
+METRICS="$OUT/metrics"
 
 # ---------------------------------------------------------------------------
 # Initialise or extend run.json.
@@ -735,6 +760,7 @@ if [ "$DRY" -eq 0 ]; then
     --argjson no_verify "$NO_VERIFY" --argjson force "$FORCE" --argjson commit "$COMMIT" \
     --argjson trust_notes "$TRUST_NOTES" --argjson planted "$PLANTED_JSON" \
     --arg steps "$STEPS" --arg model "$MODEL" --arg feature "$FEATURE" --arg head "$HEAD_SHA" \
+    --arg effort "$EFFORT" --argjson alias "$MODEL_IS_ALIAS" --arg run_dir "$OUT" \
     --argjson dirty_paths "$DIRTY_PATHS" --argjson arch_present "$ARCH_PRESENT" --argjson arch_grant "$ARCH_GRANT" '
     def nz: if . == "" then null else . end;
     {
@@ -752,7 +778,8 @@ if [ "$DRY" -eq 0 ]; then
         steps: ($steps | split(" ") | map(select(length > 0))),
         force: ($force == 1), commit: ($commit == 1), trust_project: ($trust == 1),
         allow_dirty: ($allow_dirty == 1), no_verify: ($no_verify == 1), trust_notes: ($trust_notes == 1),
-        model_requested: ($model | nz), feature: ($feature | nz)
+        model_requested: ($model | nz), model_requested_is_alias: $alias,
+        effort_requested: ($effort | nz), feature: ($feature | nz), run_dir: $run_dir
       },
       target_state: {head: ($head | nz), dirty: ($dirty == 1), dirty_paths: $dirty_paths},
       notes_tracked_in_git: $planted,
@@ -798,9 +825,49 @@ trap 'rm -rf "$WORK"' EXIT
 snapshot() {
   : > "$1"
   [ -d "$OUT" ] || return 0
-  find "$OUT" -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
+  find "$OUT" -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -path "$METRICS/*" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
     printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
   done > "$1"
+}
+
+# The metrics must be exactly what bin/measure wrote. A step that changed
+# them could make its own numbers agree with its findings.
+metrics_check() {
+  [ "$IN_GIT" -eq 1 ] || return 0
+  local path want
+  while IFS='	' read -r path want; do
+    [ -n "$path" ] || continue
+    if [ ! -f "$path" ] || [ "$(sha256_file "$path")" != "$want" ]; then
+      die "$path no longer matches what bin/measure wrote. Only the runner may write $METRICS/; stopping."
+    fi
+  done <<<"$(jq -r '(.measurements.outputs // [])[] | "\(.path)\t\(.sha256)"' "$RUN_JSON")"
+}
+
+# Measure the target at the pinned commit, once per run directory. On resume
+# the existing measurements are kept if they match run.json.
+run_measurements() {
+  if [ "$IN_GIT" -eq 0 ]; then
+    rj_write '.measurements = {skipped: "not a git repository: there is no commit to measure"}'
+    return 0
+  fi
+  local commit outputs
+  commit="$(jq -r '.target.commit' "$RUN_JSON")"
+  if jq -e --arg c "$commit" '.measurements.commit == $c' "$RUN_JSON" >/dev/null 2>&1; then
+    metrics_check
+    echo "== measurements: kept from earlier run ($METRICS/)"
+    return 0
+  fi
+  echo "== measuring the target at ${commit:0:12} (no model)"
+  "$PLUGIN_ROOT/bin/measure" --commit "$commit" --dir "$OUT" --out "$METRICS" . | sed 's/^/   /'
+  outputs="$(for f in "$METRICS"/*.tsv "$METRICS/summary.json"; do printf '%s\t%s\n' "$f" "$(sha256_file "$f")"; done \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {path: .[0], sha256: .[1]})')"
+  rj_write '$s[0] as $m | .measurements = {
+      at: $now, commit: $c, generated_by: "bin/measure", dir: $d, outputs: $o,
+      window: $m.window, history: $m.history, rows: $m.rows,
+      code_languages_not_measured: ($m.languages | to_entries
+        | map(select((.value.imports_measured | not) and ([.key] | inside(["docs", "config"]) | not)))
+        | map({language: .key, files: .value.files}))
+    }' --arg c "$commit" --arg d "$METRICS" --argjson o "$outputs" --slurpfile s "$METRICS/summary.json"
 }
 
 # Run check-citations and record the result. Returns its exit status.
@@ -894,6 +961,7 @@ run_step() {
     --allowedTools "$allow" --disallowedTools "$deny" --output-format stream-json --verbose
   if [ "$TRUST" -eq 0 ]; then set -- "$@" --setting-sources user; fi
   if [ -n "$MODEL" ]; then set -- "$@" --model "$MODEL"; fi
+  if [ -n "$EFFORT" ]; then set -- "$@" --effort "$EFFORT"; fi
   # The skills name .interrogate/ as their notes directory. With --run-dir,
   # tell the session where this run's notes are instead.
   if [ "$OUT" != ".interrogate" ]; then
@@ -908,6 +976,7 @@ run_step() {
 
   rj_check
   cit_check
+  metrics_check
   snapshot "$WORK/before"
   touch "$WORK/marker"
   arch_before=""
@@ -936,14 +1005,15 @@ run_step() {
   jq -r '.result // "(no result text)"' <<<"$result"
   echo
 
-  # The model must not have touched the runner's records.
+  # The model must not have touched the runner's records or the metrics.
   rj_check
   cit_check
+  metrics_check
 
   # Files the step wrote: new, changed, or rewritten (newer than the marker).
   snapshot "$WORK/after"
   outputs="$(
-    { find "$OUT" -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print 2>/dev/null
+    { find "$OUT" -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -path "$METRICS/*" ! -name '*.tmp.*' -print 2>/dev/null
       awk -F'\t' 'NR == FNR { b[$1] = $2; next } b[$1] != $2 { print $1 }' "$WORK/before" "$WORK/after"
     } | LC_ALL=C sort -u | while IFS= read -r f; do
       [ -f "$f" ] && printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
@@ -969,7 +1039,8 @@ run_step() {
     --argjson init "$init" --argjson result "$result" --arg model_req "$MODEL" \
     --arg skill "$(sha256_file "$PLUGIN_ROOT/skills/$step/SKILL.md")" \
     --arg allow "$allow" --arg deny "$deny" --argjson outputs "$outputs" \
-    --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" '
+    --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" \
+    --arg effort "$EFFORT" '
     def nz: if . == "" then null else . end;
     # jq'"'"'s // treats false as missing, so booleans are read with has().
     def field($o; $k; $d): if ($o | has($k)) then $o[$k] else $d end;
@@ -981,6 +1052,14 @@ run_step() {
       cost_usd: ($result.total_cost_usd // "unknown"),
       model_requested: ($model_req | nz),
       model: ($init.model // "unknown"),
+      effort_requested: ($effort | nz),
+      subagents_spawned: ($result.subagent_stats.spawned // "unknown"),
+      # Another model in modelUsage with no subagents may mean a fallback
+      # model answered. Small background calls can also cause this, hence
+      # "suspected".
+      other_models: ((($result.modelUsage // {}) | keys) - [$init.model // ""]),
+      model_fallback_suspected: (((($result.modelUsage // {}) | keys) - [$init.model // ""] | length) > 0
+                                 and (($result.subagent_stats.spawned // 0) == 0)),
       models_used: (($result.modelUsage // {}) | with_entries(.value |= {cost_usd: .costUSD, provider: (.provider // "unknown")})),
       provider_reported: $reported,
       provider_mismatch: $mismatch,
@@ -1030,6 +1109,10 @@ run_step() {
     fi
   fi
 }
+
+if [ "$DRY" -eq 0 ]; then
+  run_measurements
+fi
 
 # Notes kept from an earlier invocation are checked once up front, because
 # later steps build on them and resume would otherwise skip straight past a
