@@ -19,7 +19,7 @@ Produce three files from the notes. Don't explore the codebase again, with one e
    - Known violations and risks, ranked
    - Open questions
    
-   Write it for a new contributor. Keep the citations. State how and when this was produced, and that it is an assessment for the maintainers to review.
+   Write it for a new contributor. Keep the citations, and keep each number labelled measured or estimated, as the notes have it. State how and when this was produced, and that it is an assessment for the maintainers to review.
 
 2. **`.interrogate/issues.md`**: one entry per violation or risk that someone should act on. For each: a title, the evidence with `path:line`, why it matters, severity, and a suggested scope. Describe the problem, not the fix. These are for the user to file; don't file them.
 
@@ -27,6 +27,7 @@ Produce three files from the notes. Don't explore the codebase again, with one e
 
 ## Rules
 
+- Every number is either **measured** or **estimated**. A measured number cites the row it came from in `.interrogate/metrics/` (for example `.interrogate/metrics/churn.tsv:12`); those files are produced by the runner at the assessed commit, and you must not edit them. An estimated number says how you estimated it. If the metrics directory doesn't exist (an interactive session, or a target with no git history), every number is estimated: say so.
 - Change nothing except `ARCHITECTURE.md` and files under `.interrogate/`.
 - Carry over nothing from the notes that lacks a citation.
 - Don't commit, push, open pull requests, or file issues.

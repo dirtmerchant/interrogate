@@ -28,6 +28,7 @@ Also list what the design gets right, with the same standard of evidence. An ass
 
 ## Rules
 
+- Every number is either **measured** or **estimated**. A measured number cites the row it came from in `.interrogate/metrics/` (for example `.interrogate/metrics/churn.tsv:12`); those files are produced by the runner at the assessed commit, and you must not edit them. An estimated number says how you estimated it. If the metrics directory doesn't exist (an interactive session, or a target with no git history), every number is estimated: say so.
 - Change nothing except files under `.interrogate/`.
 - Don't list anything you can't point to in code. Generic advice that would apply to any repository is noise.
 - Rank by severity. If everything is High, nothing is.
