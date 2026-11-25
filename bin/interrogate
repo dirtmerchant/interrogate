@@ -2,18 +2,36 @@
 # Run the architecture interrogation against a repository, one fresh
 # Claude Code session per step. A new process per step is the headless
 # equivalent of running /clear between steps.
+#
+# The runner, not the model, writes the record of the run:
+# .interrogate/run.json (what was assessed, by which plugin and model, where
+# the code was sent, and a hash of every file each step wrote) and
+# .interrogate/citations.json (whether each citation resolves). The model is
+# denied write access to both.
+#
+# Keep one distinction straight: a model's finding is not evidence. The cited
+# code, at the commit recorded in run.json, is the evidence. The finding
+# points to it, and check-citations only confirms the pointer resolves.
+#
+# Bash 3.2 compatible (no associative arrays, no mapfile). Needs git and jq.
 set -euo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$PLUGIN_ROOT/lib/common.sh"
 ALL_STEPS="orient patterns boundaries trace hotspots critique capture"
+SCHEMA_VERSION=1
+SELF="interrogate"
 
 usage() {
   cat <<'EOF'
 Usage: interrogate [options] [target-dir]
+       interrogate --verify [target-dir]
 
 Runs seven read-only assessment steps against target-dir (default: current
 directory). Each step runs in its own Claude Code session and writes its
 findings to <target>/.interrogate/. The last step writes ARCHITECTURE.md.
+The runner records the run in <target>/.interrogate/run.json.
 
 Options:
   --steps a,b,c      Run only these steps, in the order given.
@@ -26,8 +44,17 @@ Options:
   --trust-project    Load the target's own Claude Code settings, hooks, and
                      MCP servers. Off by default: use it only for repositories
                      you trust.
-  --model name       Model to use for every step.
+  --model name       Model to request for every step. run.json records the
+                     model each step actually ran on.
+  --allow-dirty      Run even though the target has uncommitted changes.
+                     Citations still resolve against the committed HEAD.
+  --require-provider name
+                     Refuse to start unless the model provider is this one:
+                     anthropic, bedrock, google-cloud, foundry, or other.
+  --no-verify        Don't run check-citations after each step.
   --dry-run          Print the commands without running them.
+  --verify           Don't run anything. Recompute the hashes in run.json
+                     and report any file that no longer matches.
   -h, --help         Show this help.
 EOF
 }
@@ -45,6 +72,8 @@ note_for() {
   esac
 }
 
+die() { echo "$SELF: $*" >&2; exit "${DIE_STATUS:-1}"; }
+
 STEPS="$ALL_STEPS"
 FEATURE=""
 FORCE=0
@@ -52,41 +81,455 @@ COMMIT=0
 TRUST=0
 MODEL=""
 DRY=0
+ALLOW_DIRTY=0
+REQUIRE_PROVIDER=""
+NO_VERIFY=0
+VERIFY=0
 TARGET=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --steps)         STEPS="$(echo "${2:?--steps needs a value}" | tr ',' ' ')"; shift 2 ;;
-    --feature)       FEATURE="${2:?--feature needs a value}"; shift 2 ;;
-    --force)         FORCE=1; shift ;;
-    --commit)        COMMIT=1; shift ;;
-    --trust-project) TRUST=1; shift ;;
-    --model)         MODEL="${2:?--model needs a value}"; shift 2 ;;
-    --dry-run)       DRY=1; shift ;;
-    -h|--help)       usage; exit 0 ;;
-    -*)              echo "interrogate: unknown option $1" >&2; usage >&2; exit 2 ;;
-    *)               if [ -n "$TARGET" ]; then echo "interrogate: only one target directory" >&2; exit 2; fi
-                     TARGET="$1"; shift ;;
+    --steps)            STEPS="$(echo "${2:?--steps needs a value}" | tr ',' ' ')"; shift 2 ;;
+    --feature)          FEATURE="${2:?--feature needs a value}"; shift 2 ;;
+    --force)            FORCE=1; shift ;;
+    --commit)           COMMIT=1; shift ;;
+    --trust-project)    TRUST=1; shift ;;
+    --model)            MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --allow-dirty)      ALLOW_DIRTY=1; shift ;;
+    --require-provider) REQUIRE_PROVIDER="${2:?--require-provider needs a value}"; shift 2 ;;
+    --no-verify)        NO_VERIFY=1; shift ;;
+    --dry-run)          DRY=1; shift ;;
+    --verify)           VERIFY=1; shift ;;
+    -h|--help)          usage; exit 0 ;;
+    -*)                 echo "$SELF: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *)                  if [ -n "$TARGET" ]; then echo "$SELF: only one target directory" >&2; exit 2; fi
+                        TARGET="$1"; shift ;;
   esac
 done
 
 for step in $STEPS; do
-  note_for "$step" >/dev/null || { echo "interrogate: unknown step '$step'" >&2; exit 2; }
+  note_for "$step" >/dev/null || { echo "$SELF: unknown step '$step'" >&2; exit 2; }
 done
 
-TARGET="${TARGET:-.}"
-[ -d "$TARGET" ] || { echo "interrogate: $TARGET is not a directory" >&2; exit 2; }
-cd "$TARGET"
+case "$REQUIRE_PROVIDER" in
+  ""|anthropic|bedrock|google-cloud|foundry|other) ;;
+  vertex) REQUIRE_PROVIDER="google-cloud" ;;
+  *) echo "$SELF: --require-provider must be anthropic, bedrock, google-cloud, foundry, or other" >&2; exit 2 ;;
+esac
 
+need_jq "$SELF"
+[ "$VERIFY" -eq 0 ] || DIE_STATUS=2 die "--verify is not implemented yet"
+
+TARGET="${TARGET:-.}"
+[ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
+cd "$TARGET"
+TARGET_ABS="$(pwd -P)"
+RUN_JSON=".interrogate/run.json"
+CIT_JSON=".interrogate/citations.json"
+
+# ---------------------------------------------------------------------------
+# Provider detection. Runs before anything else so that --require-provider
+# refuses before any model session starts and before any code is read.
+#
+# Claude Code picks its provider from environment variables, which can also
+# come from the env block of settings files. Settings-file values override the
+# shell, and managed settings override everything
+# (code.claude.com/docs/en/settings, /env-vars, /amazon-bedrock,
+# /google-vertex-ai, /microsoft-foundry, /llm-gateway). This is a static
+# reading of those sources. Where it can't see a source, or the docs don't
+# say how a conflict resolves, it records unknown rather than guessing. After
+# each step the runner also compares it with what the run itself reported.
+#
+# Only variable names, host names, and region strings are ever recorded.
+# Credential variables are never read.
+# ---------------------------------------------------------------------------
+PROVIDER_KEYS='["CLAUDE_CODE_USE_BEDROCK","CLAUDE_CODE_USE_MANTLE","CLAUDE_CODE_USE_VERTEX","CLAUDE_CODE_USE_FOUNDRY","CLAUDE_CODE_USE_ANTHROPIC_AWS","CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD","CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST","ANTHROPIC_BASE_URL","ANTHROPIC_BEDROCK_BASE_URL","ANTHROPIC_BEDROCK_MANTLE_BASE_URL","ANTHROPIC_VERTEX_BASE_URL","ANTHROPIC_GOOGLE_CLOUD_BASE_URL","ANTHROPIC_FOUNDRY_BASE_URL","ANTHROPIC_FOUNDRY_RESOURCE","ANTHROPIC_AWS_BASE_URL","AWS_REGION","AWS_DEFAULT_REGION","AWS_PROFILE","CLOUD_ML_REGION"]'
+# Keep only the keys above (and Vertex per-model region overrides).
+ENV_FILTER='with_entries(select(.key as $k | (($keys | index($k)) != null) or ($k | startswith("VERTEX_REGION_CLAUDE_"))) | .value |= tostring)'
+
+P_ENV='{}'
+P_SOURCES='[]'
+P_UNREAD='[]'
+P_NOTES='[]'
+
+# Show a path under $HOME as ~/..., so labels don't carry the home directory.
+tildify() {
+  case "$1" in
+    "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+jarr_add() { jq -c --arg v "$2" '. + [$v]' <<<"$1"; }
+
+# Merge one settings file's env block over what we have. Later layers win.
+add_env_layer() {
+  local label="$1" file="$2" layer
+  [ -e "$file" ] || return 0
+  if [ ! -r "$file" ]; then P_UNREAD="$(jarr_add "$P_UNREAD" "$label (not readable)")"; return 0; fi
+  if layer="$(jq -c --argjson keys "$PROVIDER_KEYS" "(.env // {}) | $ENV_FILTER" "$file" 2>/dev/null)"; then
+    P_ENV="$(jq -c -n --argjson a "$P_ENV" --argjson b "$layer" '$a + $b')"
+    P_SOURCES="$(jarr_add "$P_SOURCES" "$label")"
+  else
+    P_UNREAD="$(jarr_add "$P_UNREAD" "$label (not valid JSON)")"
+  fi
+}
+
+penv() { jq -r --arg k "$1" '.[$k] // ""' <<<"$P_ENV"; }
+
+# on, off, or ambiguous. The docs treat an empty value as unset.
+flag_state() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    "") echo off ;;
+    1|true|yes|on) echo on ;;
+    0|false|no|off) echo off ;;
+    *) echo ambiguous ;;
+  esac
+}
+
+# host[:port] from a URL. Drops scheme, user info, path, query, and fragment,
+# so a token in a query string or user info can never be recorded.
+url_host() {
+  printf '%s' "$1" | sed -E 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?\#].*$##; s#^.*@##'
+}
+
+# Region for an AWS profile, from the shared credentials file and then the
+# config file (the order the Bedrock docs give). Prints nothing if not set.
+aws_profile_region() {
+  local prof="$1" f sec r
+  for f in "${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}" "${AWS_CONFIG_FILE:-$HOME/.aws/config}"; do
+    [ -r "$f" ] || continue
+    sec="$prof"
+    case "$f" in *config) [ "$prof" = "default" ] || sec="profile $prof" ;; esac
+    r="$(awk -v want="$sec" '
+      /^[[:space:]]*\[/ { s = $0; gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", s); insec = (s == want); next }
+      insec && /^[[:space:]]*region[[:space:]]*=/ { v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]*$/, "", v); print v; exit }
+    ' "$f")"
+    if [ -n "$r" ]; then echo "$r	$f"; return 0; fi
+  done
+}
+
+detect_provider() {
+  local cfg managed d f
+  P_ENV="$(jq -c -n --argjson keys "$PROVIDER_KEYS" "env | $ENV_FILTER")"
+  P_SOURCES='["process environment"]'
+
+  cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  add_env_layer "$(tildify "$cfg")/settings.json (user)" "$cfg/settings.json"
+  if [ "$TRUST" -eq 1 ]; then
+    add_env_layer ".claude/settings.json (project)" ".claude/settings.json"
+    add_env_layer ".claude/settings.local.json (local)" ".claude/settings.local.json"
+  fi
+  case "$(uname -s)" in
+    Darwin) managed="/Library/Application Support/ClaudeCode" ;;
+    *)      managed="/etc/claude-code" ;;
+  esac
+  add_env_layer "$managed/managed-settings.json (managed)" "$managed/managed-settings.json"
+  if [ -d "$managed/managed-settings.d" ]; then
+    for f in "$managed/managed-settings.d"/*.json; do
+      [ -f "$f" ] && add_env_layer "$f (managed drop-in)" "$f"
+    done
+  fi
+  # Sources the runner cannot read. A macOS configuration profile outranks
+  # the managed file. The path checked is the standard macOS managed
+  # preferences location, which the Claude Code docs do not state.
+  P_INCOMPLETE=0
+  for d in "/Library/Managed Preferences/com.anthropic.claudecode.plist" "/Library/Managed Preferences/$(id -un)/com.anthropic.claudecode.plist"; do
+    if [ -e "$d" ]; then
+      P_UNREAD="$(jarr_add "$P_UNREAD" "macOS configuration profile at $d (present, not parsed)")"
+      P_INCOMPLETE=1
+    fi
+  done
+  P_UNREAD="$(jarr_add "$P_UNREAD" "server-managed settings, if any (fetched by Claude Code at startup; not visible to the runner)")"
+
+  local b m v gc fo aws groups="" n=0 amb=""
+  b="$(flag_state "$(penv CLAUDE_CODE_USE_BEDROCK)")"
+  m="$(flag_state "$(penv CLAUDE_CODE_USE_MANTLE)")"
+  v="$(flag_state "$(penv CLAUDE_CODE_USE_VERTEX)")"
+  gc="$(flag_state "$(penv CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD)")"
+  fo="$(flag_state "$(penv CLAUDE_CODE_USE_FOUNDRY)")"
+  aws="$(flag_state "$(penv CLAUDE_CODE_USE_ANTHROPIC_AWS)")"
+  for pair in "CLAUDE_CODE_USE_BEDROCK:$b" "CLAUDE_CODE_USE_MANTLE:$m" "CLAUDE_CODE_USE_VERTEX:$v" "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD:$gc" "CLAUDE_CODE_USE_FOUNDRY:$fo" "CLAUDE_CODE_USE_ANTHROPIC_AWS:$aws"; do
+    case "$pair" in *:ambiguous) amb="$amb ${pair%:*}" ;; esac
+  done
+  if [ "$b" = on ] || [ "$m" = on ]; then groups="$groups bedrock"; n=$((n + 1)); fi
+  if [ "$v" = on ];  then groups="$groups vertex"; n=$((n + 1)); fi
+  if [ "$gc" = on ]; then groups="$groups google-cloud-anthropic"; n=$((n + 1)); fi
+  if [ "$fo" = on ]; then groups="$groups foundry"; n=$((n + 1)); fi
+  if [ "$aws" = on ]; then groups="$groups claude-platform-aws"; n=$((n + 1)); fi
+
+  P_ID="unknown"; P_VARIANT=""; P_REASON=""
+  P_HOST=""; P_HOST_SRC=""; P_REGION=""; P_REGION_SRC=""; P_EXTRA='{}'
+  if [ -n "$(penv CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)" ]; then
+    P_REASON="CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST is set: the host application chooses the provider, which the runner cannot see"
+  elif [ -n "$amb" ]; then
+    P_REASON="neither on nor off:$amb"
+  elif [ "$n" -gt 1 ]; then
+    P_REASON="more than one provider selected:$groups; the docs don't say which wins"
+  else
+    case "$groups" in
+      " bedrock")
+        P_ID="bedrock"
+        if [ "$b" = on ] && [ "$m" = on ]; then
+          P_VARIANT="invoke+mantle"
+          P_NOTES="$(jarr_add "$P_NOTES" "Bedrock and Mantle are both on: Mantle-format model IDs go to Mantle, all others to the Invoke API")"
+        elif [ "$m" = on ]; then
+          P_VARIANT="mantle"
+        fi
+        if [ "$P_VARIANT" = "mantle" ]; then
+          set_host ANTHROPIC_BEDROCK_MANTLE_BASE_URL
+        else
+          set_host ANTHROPIC_BEDROCK_BASE_URL
+          if [ "$P_VARIANT" = "invoke+mantle" ] && [ -n "$(penv ANTHROPIC_BEDROCK_MANTLE_BASE_URL)" ]; then
+            P_EXTRA="$(jq -c -n --arg h "$(url_host "$(penv ANTHROPIC_BEDROCK_MANTLE_BASE_URL)")" '{mantle_endpoint_host: $h, mantle_endpoint_source: "ANTHROPIC_BEDROCK_MANTLE_BASE_URL"}')"
+          fi
+        fi
+        set_aws_region ;;
+      " claude-platform-aws")
+        P_ID="other"; P_VARIANT="claude-platform-aws"
+        if [ -n "$(penv ANTHROPIC_AWS_BASE_URL)" ]; then
+          set_host ANTHROPIC_AWS_BASE_URL; set_aws_region
+        else
+          set_aws_region
+          P_HOST="aws-external-anthropic.$P_REGION.api.aws"
+          P_HOST_SRC="documented default for Claude Platform on AWS, built from the region"
+        fi ;;
+      " vertex")
+        P_ID="google-cloud"; P_VARIANT="vertex"
+        set_host ANTHROPIC_VERTEX_BASE_URL
+        if [ -n "$(penv CLOUD_ML_REGION)" ]; then
+          P_REGION="$(penv CLOUD_ML_REGION)"; P_REGION_SRC="CLOUD_ML_REGION"
+        else
+          P_REGION="us-east5"; P_REGION_SRC="documented fallback when CLOUD_ML_REGION is unset"
+        fi
+        P_EXTRA="$(jq -c '{region_overrides: (with_entries(select(.key | startswith("VERTEX_REGION_CLAUDE_"))))}' <<<"$P_ENV")" ;;
+      " google-cloud-anthropic")
+        P_ID="google-cloud"; P_VARIANT="anthropic-managed"
+        set_host ANTHROPIC_GOOGLE_CLOUD_BASE_URL
+        P_REGION="unknown"; P_REGION_SRC="not determined: the runner does not know how this variant sets a region" ;;
+      " foundry")
+        P_ID="foundry"
+        if [ -n "$(penv ANTHROPIC_FOUNDRY_BASE_URL)" ]; then
+          set_host ANTHROPIC_FOUNDRY_BASE_URL
+        elif [ -n "$(penv ANTHROPIC_FOUNDRY_RESOURCE)" ]; then
+          case "$(penv ANTHROPIC_FOUNDRY_RESOURCE)" in
+            *[!A-Za-z0-9-]*) P_HOST="unknown"; P_HOST_SRC="ANTHROPIC_FOUNDRY_RESOURCE is not a plain resource name" ;;
+            *) P_HOST="$(penv ANTHROPIC_FOUNDRY_RESOURCE).services.ai.azure.com"
+               P_HOST_SRC="derived from ANTHROPIC_FOUNDRY_RESOURCE, using the URL form in the Foundry setup docs" ;;
+          esac
+        else
+          P_HOST="unknown"; P_HOST_SRC="neither ANTHROPIC_FOUNDRY_BASE_URL nor ANTHROPIC_FOUNDRY_RESOURCE is set"
+        fi
+        P_REGION_SRC="n/a: Foundry has no region setting; the resource determines it" ;;
+      "")
+        if [ -n "$(penv ANTHROPIC_BASE_URL)" ]; then
+          set_host ANTHROPIC_BASE_URL
+          if [ "$P_HOST" = "api.anthropic.com" ]; then
+            P_ID="anthropic"
+          else
+            P_ID="other"; P_VARIANT="gateway"
+          fi
+        else
+          P_ID="anthropic"
+          P_HOST_SRC="provider default (no endpoint override set)"
+        fi
+        P_REGION_SRC="n/a" ;;
+    esac
+    if [ "$P_ID" != "anthropic" ] && [ "$P_ID" != "other" ] && [ -n "$(penv ANTHROPIC_BASE_URL)" ]; then
+      P_NOTES="$(jarr_add "$P_NOTES" "ANTHROPIC_BASE_URL is also set (host $(url_host "$(penv ANTHROPIC_BASE_URL)")); the runner does not know whether $P_ID uses it")"
+    fi
+  fi
+
+  PROVIDER_JSON="$(jq -c -n \
+    --arg id "$P_ID" --arg variant "$P_VARIANT" --arg reason "$P_REASON" \
+    --arg host "$P_HOST" --arg hsrc "$P_HOST_SRC" \
+    --arg region "$P_REGION" --arg rsrc "$P_REGION_SRC" \
+    --argjson sources "$P_SOURCES" --argjson unread "$P_UNREAD" --argjson notes "$P_NOTES" \
+    --argjson extra "$P_EXTRA" --argjson incomplete "$P_INCOMPLETE" \
+    --arg required "$REQUIRE_PROVIDER" \
+    --argjson vars "$(jq -c 'keys' <<<"$P_ENV")" '
+    def nz: if . == "" then null else . end;
+    {
+      detected: $id,
+      variant: ($variant | nz),
+      unknown_reason: ($reason | nz),
+      endpoint_host: ($host | nz),
+      endpoint_source: ($hsrc | nz),
+      region: ($region | nz),
+      region_source: ($rsrc | nz),
+      method: "static reading of environment and settings files before the run",
+      variables_seen: $vars,
+      sources_read: $sources,
+      sources_not_read: $unread,
+      detection_complete: ($incomplete == 0),
+      notes: $notes,
+      required: ($required | nz)
+    } + $extra')"
+}
+
+set_host() {
+  local var="$1" val
+  val="$(penv "$var")"
+  if [ -n "$val" ]; then
+    P_HOST="$(url_host "$val")"; P_HOST_SRC="$var"
+  else
+    P_HOST=""; P_HOST_SRC="provider default ($var not set; the docs don't state the default host)"
+  fi
+}
+
+set_aws_region() {
+  local pr
+  if [ -n "$(penv AWS_REGION)" ]; then
+    P_REGION="$(penv AWS_REGION)"; P_REGION_SRC="AWS_REGION"
+  elif [ -n "$(penv AWS_DEFAULT_REGION)" ]; then
+    P_REGION="$(penv AWS_DEFAULT_REGION)"; P_REGION_SRC="AWS_DEFAULT_REGION"
+  else
+    local prof
+    prof="$(penv AWS_PROFILE)"; prof="${prof:-default}"
+    pr="$(aws_profile_region "$prof")"
+    if [ -n "$pr" ]; then
+      P_REGION="${pr%%	*}"; P_REGION_SRC="AWS profile '$prof' in $(tildify "${pr#*	}")"
+    else
+      P_REGION="us-east-1"; P_REGION_SRC="documented fallback: no AWS_REGION, AWS_DEFAULT_REGION, or profile region"
+    fi
+  fi
+}
+
+print_provider() {
+  jq -r '
+    "   provider: \(.detected)\(if .variant then " (\(.variant))" else "" end)",
+    "   endpoint: \(.endpoint_host // "default") [\(.endpoint_source // "-")]",
+    "   region:   \(.region // "-") [\(.region_source // "-")]",
+    (if .unknown_reason then "   unknown because: \(.unknown_reason)" else empty end),
+    "   read from: \(.sources_read | join(", "))",
+    (.notes[] | "   note: \(.)")' <<<"$PROVIDER_JSON"
+}
+
+# ---------------------------------------------------------------------------
+# run.json helpers. Every write goes through rj_write, which first checks that
+# the file is exactly what the runner last wrote.
+# ---------------------------------------------------------------------------
+RUN_HASH=""
+
+rj_check() {
+  [ -n "$RUN_HASH" ] || return 0
+  if [ ! -f "$RUN_JSON" ] || [ "$(sha256_file "$RUN_JSON")" != "$RUN_HASH" ]; then
+    die "$RUN_JSON changed while the runner was not writing it. Only the runner may write it; stopping. Inspect it before continuing."
+  fi
+}
+
+# rj_write FILTER [jq args...]: apply a jq filter to run.json in place.
+rj_write() {
+  local filter="$1"; shift
+  rj_check
+  jq "$@" --arg now "$(now_utc)" "$filter | .updated_at = \$now" "$RUN_JSON" | write_atomic "$RUN_JSON"
+  RUN_HASH="$(sha256_file "$RUN_JSON")"
+}
+
+CIT_HASH=""
+cit_check() {
+  [ -n "$CIT_HASH" ] || return 0
+  if [ ! -f "$CIT_JSON" ] || [ "$(sha256_file "$CIT_JSON")" != "$CIT_HASH" ]; then
+    die "$CIT_JSON changed while the runner was not writing it. Only the runner may write it; stopping."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Start-up checks.
+# ---------------------------------------------------------------------------
+detect_provider
+echo "== provider (detected before the run)"
+print_provider
+
+if [ -n "$REQUIRE_PROVIDER" ]; then
+  if [ "$P_ID" != "$REQUIRE_PROVIDER" ]; then
+    die "--require-provider $REQUIRE_PROVIDER, but the detected provider is $P_ID. Refusing to start: no session was started and no code was read."
+  fi
+  if [ "$P_INCOMPLETE" -eq 1 ]; then
+    die "--require-provider $REQUIRE_PROVIDER, but a settings source the runner cannot read is present (see above). Refusing to start: no session was started and no code was read."
+  fi
+  echo "   matches --require-provider $REQUIRE_PROVIDER"
+fi
+
+CLAUDE_VERSION="unknown"
 if [ "$DRY" -eq 0 ]; then
-  command -v claude >/dev/null || { echo "interrogate: the claude CLI is not on PATH" >&2; exit 127; }
+  command -v claude >/dev/null || DIE_STATUS=127 die "the claude CLI is not on PATH"
+fi
+if command -v claude >/dev/null 2>&1; then
+  CLAUDE_VERSION="$(claude --version 2>/dev/null | head -n1 || true)"
+  CLAUDE_VERSION="${CLAUDE_VERSION:-unknown}"
 fi
 
 IN_GIT=0
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 && IN_GIT=1
+REPO_ROOT=""
+PREFIX=""
+HEAD_SHA=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  IN_GIT=1
+  REPO_ROOT="$(git rev-parse --show-toplevel)"
+  PREFIX="$(git rev-parse --show-prefix)"
+  HEAD_SHA="$(git rev-parse -q --verify HEAD || true)"
+  [ -n "$HEAD_SHA" ] || die "the target is a git repository with no commits; commit something first so the run can be pinned to a revision"
+fi
+
+# Resume: the notes must all come from one revision.
+RESUME=0
+if [ -f "$RUN_JSON" ]; then
+  jq -e --argjson v "$SCHEMA_VERSION" '.schema_version == $v' "$RUN_JSON" >/dev/null 2>&1 \
+    || die "$RUN_JSON is not a schema_version $SCHEMA_VERSION run record. Move .interrogate/ aside to start a new assessment."
+  RESUME=1
+  rec_git="$(jq -r '.target.is_git' "$RUN_JSON")"
+  rec_commit="$(jq -r '.target.commit // empty' "$RUN_JSON")"
+  if [ "$rec_git" = "true" ] && [ "$IN_GIT" -eq 0 ]; then
+    die "$RUN_JSON records a git target, but $TARGET_ABS is no longer a git repository."
+  fi
+  if [ "$rec_git" = "false" ] && [ "$IN_GIT" -eq 1 ]; then
+    die "$RUN_JSON records a non-git target, but $TARGET_ABS is now a git repository. Move .interrogate/ aside to start a new assessment pinned to a commit."
+  fi
+  if [ "$IN_GIT" -eq 1 ] && [ "$HEAD_SHA" != "$rec_commit" ]; then
+    # --commit moves HEAD with the runner's own commits. Allow exactly that:
+    # every commit since the pinned one was made by this runner and touches
+    # only the notes and ARCHITECTURE.md.
+    ok=1
+    if git merge-base --is-ancestor "$rec_commit" "$HEAD_SHA" 2>/dev/null; then
+      for c in $(git rev-list "$rec_commit..$HEAD_SHA"); do
+        jq -e --arg c "$c" '(.runner_commits // []) | index($c) != null' "$RUN_JSON" >/dev/null || { ok=0; break; }
+        if git diff-tree --no-commit-id --name-only -r "$c" | grep -v -e "^${PREFIX}\.interrogate/" -e "^${PREFIX}ARCHITECTURE\.md\$" >/dev/null; then ok=0; break; fi
+      done
+    else
+      ok=0
+    fi
+    if [ "$ok" -eq 0 ]; then
+      die "HEAD is now ${HEAD_SHA:0:12}, but the notes in .interrogate/ were written against ${rec_commit:0:12} (run.json). Resuming would mix findings from two revisions.
+  To continue the existing assessment: git checkout ${rec_commit:0:12}
+  To assess the new revision: move .interrogate/ aside and run again."
+    fi
+  fi
+fi
+
+# Dirty tree: the commit SHA only describes the code if the tree matches it.
+DIRTY=0
+DIRTY_PATHS='[]'
+if [ "$IN_GIT" -eq 1 ]; then
+  excl=(":(top,exclude)${PREFIX}.interrogate")
+  if [ "$RESUME" -eq 1 ] && jq -e '.architecture_md.written_by_run == true' "$RUN_JSON" >/dev/null 2>&1; then
+    excl+=(":(top,exclude)${PREFIX}ARCHITECTURE.md")
+  fi
+  status="$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all -- "${excl[@]}")"
+  if [ -n "$status" ]; then
+    DIRTY=1
+    DIRTY_PATHS="$(printf '%s\n' "$status" | cut -c4- | head -n 200 | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+    if [ "$ALLOW_DIRTY" -eq 0 ]; then
+      echo "$SELF: the target has uncommitted changes:" >&2
+      printf '%s\n' "$status" | head -n 20 | sed 's/^/  /' >&2
+      die "Refusing to run: the assessment is pinned to commit ${HEAD_SHA:0:12}, and these changes are not in it. Commit or stash them, or pass --allow-dirty (citations will still resolve against the commit, not the edited files)."
+    fi
+    echo "== the target has uncommitted changes; continuing because of --allow-dirty (recorded in run.json)"
+  fi
+fi
 
 if [ "$COMMIT" -eq 1 ]; then
-  [ "$IN_GIT" -eq 1 ] || { echo "interrogate: --commit needs a git repository" >&2; exit 2; }
+  [ "$IN_GIT" -eq 1 ] || DIE_STATUS=2 die "--commit needs a git repository"
   branch="$(git symbolic-ref --short -q HEAD || true)"
   if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
     if [ "$DRY" -eq 1 ]; then
@@ -101,6 +544,151 @@ fi
 # --permission-mode dontAsk. File reads, searches, and Claude Code's built-in
 # read-only shell commands need no approval, so they still run.
 BASE_ALLOW='Edit(/.interrogate/**),Bash(git log *),Bash(git show *),Bash(git ls-files *),Bash(git blame *),Bash(git shortlog *),Bash(sort),Bash(sort -rn),Bash(sort -nr),Bash(uniq),Bash(uniq -c)'
+# The runner's own records. A deny rule wins over the allow above.
+BASE_DENY='Edit(/.interrogate/run.json),Edit(/.interrogate/citations.json)'
+
+# ---------------------------------------------------------------------------
+# Initialise or extend run.json.
+# ---------------------------------------------------------------------------
+plugin_json() {
+  local version commit="unknown" pdirty="null" skills='{}' s
+  version="$(jq -r '.version // "unknown"' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null || echo unknown)"
+  if [ "$(git -C "$PLUGIN_ROOT" rev-parse --show-toplevel 2>/dev/null || true)" = "$PLUGIN_ROOT" ]; then
+    commit="$(git -C "$PLUGIN_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [ -n "$(git -C "$PLUGIN_ROOT" status --porcelain 2>/dev/null)" ]; then pdirty=true; else pdirty=false; fi
+  fi
+  for s in $ALL_STEPS; do
+    skills="$(jq -c --arg s "$s" --arg p "skills/$s/SKILL.md" --arg h "$(sha256_file "$PLUGIN_ROOT/skills/$s/SKILL.md")" \
+      '. + {($s): {path: $p, sha256: $h}}' <<<"$skills")"
+  done
+  jq -c -n --arg v "$version" --arg c "$commit" --argjson d "$pdirty" --argjson sk "$skills" \
+    '{version: $v, commit: $c, dirty: $d, skills: $sk}'
+}
+
+ARCH_PRESENT=0
+[ -e ARCHITECTURE.md ] && ARCH_PRESENT=1
+ARCH_GRANT=1
+
+INVOCATION=0
+if [ "$DRY" -eq 0 ]; then
+  mkdir -p .interrogate
+  PLUGIN_INFO="$(plugin_json)"
+  invocation="$(jq -c -n \
+    --arg at "$(now_utc)" --arg ccv "$CLAUDE_VERSION" --argjson plugin "$PLUGIN_INFO" \
+    --argjson provider "$PROVIDER_JSON" \
+    --arg allow "$BASE_ALLOW" --arg deny "$BASE_DENY" \
+    --argjson trust "$TRUST" --argjson dirty "$DIRTY" --argjson allow_dirty "$ALLOW_DIRTY" \
+    --argjson no_verify "$NO_VERIFY" --argjson force "$FORCE" --argjson commit "$COMMIT" \
+    --arg steps "$STEPS" --arg model "$MODEL" --arg feature "$FEATURE" --arg head "$HEAD_SHA" \
+    --argjson dirty_paths "$DIRTY_PATHS" --argjson arch_present "$ARCH_PRESENT" --argjson arch_grant "$ARCH_GRANT" '
+    def nz: if . == "" then null else . end;
+    {
+      started_at: $at,
+      claude_code_version: $ccv,
+      plugin: $plugin,
+      provider: $provider,
+      permissions: {
+        mode: "dontAsk",
+        setting_sources: (if $trust == 1 then "default (--trust-project)" else "user" end),
+        base_allowed_tools: ($allow | split(",")),
+        disallowed_tools: ($deny | split(","))
+      },
+      options: {
+        steps: ($steps | split(" ") | map(select(length > 0))),
+        force: ($force == 1), commit: ($commit == 1), trust_project: ($trust == 1),
+        allow_dirty: ($allow_dirty == 1), no_verify: ($no_verify == 1),
+        model_requested: ($model | nz), feature: ($feature | nz)
+      },
+      target_state: {head: ($head | nz), dirty: ($dirty == 1), dirty_paths: $dirty_paths},
+      architecture_md: {present_at_start: ($arch_present == 1), write_granted: ($arch_grant == 1)}
+    }')"
+
+  if [ "$RESUME" -eq 0 ]; then
+    jq -n \
+      --argjson v "$SCHEMA_VERSION" --arg at "$(now_utc)" --arg path "$TARGET_ABS" \
+      --argjson is_git "$IN_GIT" --arg root "$REPO_ROOT" --arg prefix "$PREFIX" --arg commit "$HEAD_SHA" \
+      --argjson dirty "$DIRTY" --argjson allow_dirty "$ALLOW_DIRTY" --argjson inv "$invocation" '
+      def nz: if . == "" then null else . end;
+      {
+        schema_version: $v,
+        about: "Written by bin/interrogate, never by the model. A finding in the notes is not evidence: the cited code at target.commit is, and the finding points to it. This file is unsigned, so it shows accidental changes, not deliberate ones.",
+        created_at: $at,
+        updated_at: $at,
+        target: {
+          path: $path, is_git: ($is_git == 1),
+          repo_root: ($root | nz), repo_prefix: (if $is_git == 1 then $prefix else null end),
+          commit: ($commit | nz),
+          dirty_at_start: ($dirty == 1), allow_dirty: ($allow_dirty == 1)
+        },
+        invocations: [$inv],
+        runner_commits: [],
+        steps: [],
+        citation_checks: [],
+        architecture_md: {sha256: null, written_by_run: false}
+      }' | write_atomic "$RUN_JSON"
+    RUN_HASH="$(sha256_file "$RUN_JSON")"
+  else
+    RUN_HASH="$(sha256_file "$RUN_JSON")"
+    rj_write '.invocations += [$inv]' --argjson inv "$invocation"
+  fi
+  INVOCATION="$(jq '.invocations | length - 1' "$RUN_JSON")"
+  [ -f "$CIT_JSON" ] && CIT_HASH="$(sha256_file "$CIT_JSON")"
+fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/interrogate.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# Hash every file under .interrogate/ except the runner's own records.
+snapshot() {
+  : > "$1"
+  [ -d .interrogate ] || return 0
+  find .interrogate -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
+    printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
+  done > "$1"
+}
+
+# Run check-citations and record the result. Returns its exit status.
+run_citation_check() {
+  local scope="$1"; shift
+  local args=(--quiet --out "$CIT_JSON") rc
+  if [ "$IN_GIT" -eq 1 ]; then
+    args+=(--commit "$(jq -r '.target.commit' "$RUN_JSON")")
+  else
+    args+=(--worktree)
+  fi
+  if jq -e '.architecture_md.written_by_run == true' "$RUN_JSON" >/dev/null; then
+    args+=(--include ARCHITECTURE.md)
+  fi
+  cit_check
+  set +e
+  "$PLUGIN_ROOT/bin/check-citations" "${args[@]}" . "$@"
+  rc=$?
+  set -e
+  [ "$rc" -le 1 ] || die "check-citations failed to run (exit $rc)"
+  CIT_HASH="$(sha256_file "$CIT_JSON")"
+  rj_write '$cj[0] as $c | .citation_checks += [{
+      at: $c.generated_at, scope: $scope, invocation: $inv,
+      resolved_against: $c.resolved_against,
+      citations: $c.summary.citations, passed: $c.summary.passed,
+      failed: $c.summary.failed, skipped: $c.summary.skipped,
+      files: ($c.files | map({path, sha256})),
+      citations_json_sha256: $h
+    }]' --slurpfile cj "$CIT_JSON" --arg scope "$scope" --argjson inv "$INVOCATION" --arg h "$CIT_HASH"
+  return "$rc"
+}
+
+# Compare the provider the run reported with the static detection.
+# modelUsage[].provider is not a documented field; it was observed in Claude
+# Code 2.1.332 as "firstParty" for the Anthropic API.
+provider_mismatch() {
+  local reported="$1"
+  [ "$reported" != "[]" ] || return 1
+  case "$P_ID" in
+    anthropic) jq -e 'any(. != "firstParty")' <<<"$reported" >/dev/null ;;
+    bedrock|google-cloud|foundry) jq -e 'any(. == "firstParty")' <<<"$reported" >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
 
 run_step() {
   step="$1"
@@ -117,11 +705,13 @@ run_step() {
   fi
 
   allow="$BASE_ALLOW"
+  deny="$BASE_DENY"
   if [ "$step" = "capture" ]; then
     allow="$allow,Edit(/ARCHITECTURE.md)"
   fi
 
-  set -- claude -p "$prompt" --plugin-dir "$PLUGIN_ROOT" --permission-mode dontAsk --allowedTools "$allow"
+  set -- claude -p "$prompt" --plugin-dir "$PLUGIN_ROOT" --permission-mode dontAsk \
+    --allowedTools "$allow" --disallowedTools "$deny" --output-format stream-json --verbose
   if [ "$TRUST" -eq 0 ]; then set -- "$@" --setting-sources user; fi
   if [ -n "$MODEL" ]; then set -- "$@" --model "$MODEL"; fi
 
@@ -131,15 +721,115 @@ run_step() {
     return 0
   fi
 
-  mkdir -p .interrogate
-  if ! "$@" </dev/null; then
-    echo "interrogate: claude failed during step '$step'; nothing after it was run" >&2
-    exit 1
+  rj_check
+  cit_check
+  snapshot "$WORK/before"
+  touch "$WORK/marker"
+  arch_before=""
+  [ -f ARCHITECTURE.md ] && arch_before="$(sha256_file ARCHITECTURE.md)"
+  started="$(now_utc)"
+
+  # stream-json: the system/init event names the model the session actually
+  # ran on; the final result event carries the session ID, cost, per-model
+  # usage, and the result text. Tool calls are echoed as progress.
+  set +e
+  "$@" </dev/null | tee "$WORK/$step.jsonl" | jq -rR --unbuffered '
+    fromjson? | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")
+    | "   . \(.name) \(.input.file_path // .input.path // .input.pattern // .input.command // .input.description // "" | tostring | .[0:110])"'
+  rcs=("${PIPESTATUS[@]}")
+  set -e
+  rc="${rcs[0]}"
+  ended="$(now_utc)"
+
+  init="$(jq -cR 'fromjson? | select(.type == "system" and .subtype == "init")' "$WORK/$step.jsonl" | head -n1)"
+  result="$(jq -cR 'fromjson? | select(.type == "result")' "$WORK/$step.jsonl" | tail -n1)"
+  [ -n "$init" ] || init='{}'
+  [ -n "$result" ] || result='{}'
+
+  echo
+  jq -r '.result // "(no result text)"' <<<"$result"
+  echo
+
+  # The model must not have touched the runner's records.
+  rj_check
+  cit_check
+
+  # Files the step wrote: new, changed, or rewritten (newer than the marker).
+  snapshot "$WORK/after"
+  outputs="$(
+    { find .interrogate -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print 2>/dev/null
+      awk -F'\t' 'NR == FNR { b[$1] = $2; next } b[$1] != $2 { print $1 }' "$WORK/before" "$WORK/after"
+    } | LC_ALL=C sort -u | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
+    done | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {path: .[0], sha256: .[1]})'
+  )"
+  arch_after=""
+  [ -f ARCHITECTURE.md ] && arch_after="$(sha256_file ARCHITECTURE.md)"
+
+  reported="$(jq -c '[(.modelUsage // {})[] | .provider // empty] | unique' <<<"$result")"
+  mismatch=false
+  if provider_mismatch "$reported"; then mismatch=true; fi
+
+  status="completed"
+  if [ "$rc" -ne 0 ] || [ "$(jq -r '.is_error // false' <<<"$result")" = "true" ]; then
+    status="failed"
+  elif [ ! -s "$note" ]; then
+    status="failed: notes not written"
   fi
 
-  if [ ! -s "$note" ]; then
-    echo "interrogate: step '$step' finished without writing $note" >&2
-    exit 1
+  entry="$(jq -c -n \
+    --arg step "$step" --argjson inv "$INVOCATION" --arg status "$status" \
+    --arg started "$started" --arg ended "$ended" --argjson rc "$rc" \
+    --argjson init "$init" --argjson result "$result" --arg model_req "$MODEL" \
+    --arg skill "$(sha256_file "$PLUGIN_ROOT/skills/$step/SKILL.md")" \
+    --arg allow "$allow" --arg deny "$deny" --argjson outputs "$outputs" \
+    --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" '
+    def nz: if . == "" then null else . end;
+    {
+      step: $step, invocation: $inv, status: $status,
+      started_at: $started, ended_at: $ended, exit_status: $rc,
+      is_error: ($result.is_error // null),
+      session_id: ($result.session_id // $init.session_id // "unknown"),
+      cost_usd: ($result.total_cost_usd // "unknown"),
+      model_requested: ($model_req | nz),
+      model: ($init.model // "unknown"),
+      models_used: (($result.modelUsage // {}) | with_entries(.value |= {cost_usd: .costUSD, provider: (.provider // "unknown")})),
+      provider_reported: $reported,
+      provider_mismatch: $mismatch,
+      served_by_anthropic: ($init.served_by_anthropic // "unknown"),
+      permission_denials: (($result.permission_denials // []) | length),
+      skill_sha256: $skill,
+      allowed_tools: ($allow | split(",")),
+      disallowed_tools: ($deny | split(",")),
+      outputs: $outputs,
+      architecture_md_sha256: ($arch | nz),
+      citations: null
+    }')"
+  rj_write '.steps += [$e]' --argjson e "$entry"
+  if [ -n "$arch_after" ] && [ "$arch_after" != "$arch_before" ] && [ "$ARCH_PRESENT" -eq 0 ]; then
+    rj_write '.architecture_md = {sha256: $h, written_by_run: true, step: $s}' --arg h "$arch_after" --arg s "$step"
+  fi
+
+  if [ "$mismatch" = "true" ]; then
+    die "step '$step' reported provider $(jq -r 'join(",")' <<<"$reported"), but detection before the run said $P_ID. Recorded in run.json; stopping."
+  fi
+  if [ "$status" = "failed" ]; then
+    die "claude failed during step '$step' (exit $rc); nothing after it was run"
+  fi
+  if [ "$status" != "completed" ]; then
+    die "step '$step' finished without writing $note"
+  fi
+
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    rj_write '.steps[(.steps | length) - 1].citations = {skipped: true, reason: "--no-verify"}'
+  else
+    echo "== $step: checking citations"
+    if run_citation_check "after $step"; then crc=0; else crc=1; fi
+    rj_write '.steps[(.steps | length) - 1].citations = (.citation_checks[-1] | {citations, passed, failed, skipped, citations_json_sha256})'
+    if [ "$crc" -ne 0 ]; then
+      die "citations in the notes don't resolve (listed above; details in $CIT_JSON). Stopping before the next step.
+  Fix the notes by hand, or re-run the step with --steps $step --force. --no-verify skips this check."
+    fi
   fi
 
   if [ "$COMMIT" -eq 1 ]; then
@@ -147,10 +837,36 @@ run_step() {
     if [ -f ARCHITECTURE.md ]; then git add -- ARCHITECTURE.md; fi
     if ! git diff --cached --quiet; then
       git commit -q -m "interrogate: $step"
+      rj_write '.runner_commits += [$c]' --arg c "$(git rev-parse HEAD)"
       echo "== $step: committed"
     fi
   fi
 }
+
+in_steps() { case " $STEPS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# Notes kept from an earlier invocation are checked once up front, because
+# later steps build on them and resume would otherwise skip straight past a
+# step whose citations failed.
+if [ "$DRY" -eq 0 ] && [ "$NO_VERIFY" -eq 0 ]; then
+  keep=()
+  for s in $ALL_STEPS; do
+    n=".interrogate/$(note_for "$s")"
+    [ -s "$n" ] || continue
+    if [ "$FORCE" -eq 1 ] && in_steps "$s"; then continue; fi
+    keep+=("$n")
+  done
+  if ! { [ "$FORCE" -eq 1 ] && in_steps capture; }; then
+    for n in .interrogate/CLAUDE.proposed.md .interrogate/ARCHITECTURE.proposed.md; do
+      [ -s "$n" ] && keep+=("$n")
+    done
+  fi
+  if [ ${#keep[@]} -gt 0 ]; then
+    echo "== checking citations in the notes already present"
+    run_citation_check "existing notes at start" "${keep[@]}" \
+      || die "existing notes have citations that don't resolve (listed above). Fix them, re-run those steps with --force, or pass --no-verify."
+  fi
+fi
 
 for step in $STEPS; do
   run_step "$step"
@@ -159,5 +875,6 @@ done
 if [ "$DRY" -eq 0 ]; then
   echo
   echo "Notes are in $(pwd)/.interrogate/"
+  echo "Run record: $(pwd)/$RUN_JSON"
   if [ -f ARCHITECTURE.md ]; then echo "Assessment: $(pwd)/ARCHITECTURE.md"; fi
 fi
