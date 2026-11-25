@@ -206,6 +206,10 @@ for nf in "${NOTES[@]}"; do
           if [ "$norm" != "$DIR/metrics/$mbase" ] && [ -f "$DIR/metrics/$mbase" ] && ! exists_in_code "$norm"; then
             norm="$DIR/metrics/$mbase"
           fi ;;
+        # The same shortening for the notes: 01-orient.md:46 is this run's
+        # notes, which are skipped below because a note is not evidence.
+        0[1-6]-*.md|issues.md|CLAUDE.proposed.md|ARCHITECTURE.proposed.md)
+          if [ -f "$DIR/$norm" ] && ! exists_in_code "$norm"; then norm="$DIR/$norm"; fi ;;
       esac
       case "$norm" in
         "$DIR"/metrics/*) pre="metric" ;;
