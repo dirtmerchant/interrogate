@@ -32,6 +32,7 @@ With no notes files given, checks every .interrogate/*.md.
 Options:
   --commit SHA      Resolve against this commit instead.
   --worktree        Resolve against the working tree, even in a git repository.
+  --dir DIR         Notes directory, relative to target-dir (default .interrogate).
   --include FILE    Also check FILE (repeatable), e.g. ARCHITECTURE.md.
   --out FILE        Where to write the report (default .interrogate/citations.json,
                     relative to target-dir). Use - for stdout.
@@ -45,7 +46,8 @@ EOF
 
 COMMIT=""
 WORKTREE=0
-OUT=".interrogate/citations.json"
+DIR=".interrogate"
+OUT=""
 QUIET=0
 TARGET=""
 NOTES=()
@@ -55,6 +57,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --commit)   COMMIT="${2:?--commit needs a value}"; shift 2 ;;
     --worktree) WORKTREE=1; shift ;;
+    --dir)      DIR="${2:?--dir needs a value}"; DIR="${DIR%/}"; shift 2 ;;
     --include)  INCLUDES+=("${2:?--include needs a value}"); shift 2 ;;
     --out)      OUT="${2:?--out needs a value}"; shift 2 ;;
     -q|--quiet) QUIET=1; shift ;;
@@ -68,6 +71,7 @@ need_jq "$SELF"
 TARGET="${TARGET:-.}"
 [ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
 cd "$TARGET"
+OUT="${OUT:-$DIR/citations.json}"
 
 IN_GIT=0
 PREFIX=""
@@ -79,8 +83,8 @@ fi
 # Decide what to resolve against.
 MODE="worktree"
 if [ "$WORKTREE" -eq 0 ] && [ "$IN_GIT" -eq 1 ]; then
-  if [ -z "$COMMIT" ] && [ -f .interrogate/run.json ]; then
-    COMMIT="$(jq -r '.target.commit // empty' .interrogate/run.json 2>/dev/null || true)"
+  if [ -z "$COMMIT" ] && [ -f "$DIR/run.json" ]; then
+    COMMIT="$(jq -r '.target.commit // empty' "$DIR/run.json" 2>/dev/null || true)"
   fi
   if [ -z "$COMMIT" ]; then
     COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
@@ -92,9 +96,9 @@ if [ "$WORKTREE" -eq 0 ] && [ "$IN_GIT" -eq 1 ]; then
   fi
 fi
 
-# Default notes set: every Markdown file the steps write under .interrogate/.
+# Default notes set: every Markdown file the steps write in the notes directory.
 if [ ${#NOTES[@]} -eq 0 ]; then
-  for f in .interrogate/*.md; do
+  for f in "$DIR"/*.md; do
     [ -f "$f" ] && NOTES+=("$f")
   done
 fi
@@ -177,7 +181,7 @@ for nf in "${NOTES[@]}"; do
     if [ -z "$pre" ]; then
       norm="$(normalize "$path")"
       case "$norm" in
-        .interrogate/*) pre="skip:cites the notes, not the code" ;;
+        "$DIR"/*|.interrogate/*) pre="skip:cites the notes, not the code" ;;
         ESCAPE) pre="fail:path climbs above the target" ;;
       esac
     fi

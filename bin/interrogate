@@ -52,6 +52,9 @@ Options:
                      Refuse to start unless the model provider is this one:
                      anthropic, bedrock, google-cloud, foundry, or other.
   --no-verify        Don't run check-citations after each step.
+  --run-dir dir      Write notes, metrics, and run.json to dir (relative to
+                     target-dir, default .interrogate) instead. Use one per
+                     run to compare runs with bin/compare-runs.
   --trust-notes      Accept notes files that are tracked in the target's git
                      history as completed steps. Without it the run refuses,
                      because a committed notes file may not come from a run.
@@ -89,6 +92,7 @@ REQUIRE_PROVIDER=""
 NO_VERIFY=0
 TRUST_NOTES=0
 VERIFY=0
+OUT=".interrogate"
 TARGET=""
 
 while [ $# -gt 0 ]; do
@@ -105,6 +109,7 @@ while [ $# -gt 0 ]; do
     --trust-notes)      TRUST_NOTES=1; shift ;;
     --dry-run)          DRY=1; shift ;;
     --verify)           VERIFY=1; shift ;;
+    --run-dir)          OUT="${2:?--run-dir needs a value}"; shift 2 ;;
     -h|--help)          usage; exit 0 ;;
     -*)                 echo "$SELF: unknown option $1" >&2; usage >&2; exit 2 ;;
     *)                  if [ -n "$TARGET" ]; then echo "$SELF: only one target directory" >&2; exit 2; fi
@@ -124,12 +129,22 @@ esac
 
 need_jq "$SELF"
 
+# The notes directory must be a plain relative path inside the target: the
+# permission rules anchor it at the target root, and the dirty check and
+# resume rules exclude it by name.
+OUT="${OUT%/}"
+case "$OUT" in
+  ""|.|/*|..|../*|*/../*|*/..) echo "$SELF: --run-dir must be a relative path inside the target, such as .interrogate/runs/a" >&2; exit 2 ;;
+esac
+case "$OUT" in *[!A-Za-z0-9._/-]*) echo "$SELF: --run-dir may contain only letters, digits, '.', '_', '-', and '/'" >&2; exit 2 ;; esac
+OUT_RE="$(printf '%s' "$OUT" | sed 's/[.]/\\./g')"
+
 TARGET="${TARGET:-.}"
 [ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
 cd "$TARGET"
 TARGET_ABS="$(pwd -P)"
-RUN_JSON=".interrogate/run.json"
-CIT_JSON=".interrogate/citations.json"
+RUN_JSON="$OUT/run.json"
+CIT_JSON="$OUT/citations.json"
 
 # ---------------------------------------------------------------------------
 # --verify: recompute the hash of every file run.json recorded and report any
@@ -162,8 +177,8 @@ do_verify() {
       reduce ($s.outputs // [])[] as $o (.;
         if $s.status == "adopted" and has($o.path) then . else .[$o.path] = $o.sha256 end)))
     + (if .architecture_md.sha256 then {"ARCHITECTURE.md": .architecture_md.sha256} else {} end)
-    + (if (.citation_checks | length) > 0 then {".interrogate/citations.json": .citation_checks[-1].citations_json_sha256} else {} end)
-    | to_entries[] | "\(.key)\t\(.value)"' "$RUN_JSON")"
+    + (if (.citation_checks | length) > 0 then {($cit): .citation_checks[-1].citations_json_sha256} else {} end)
+    | to_entries[] | "\(.key)\t\(.value)"' --arg cit "$CIT_JSON" "$RUN_JSON")"
 
   while IFS='	' read -r path want; do
     [ -n "$path" ] || continue
@@ -549,7 +564,7 @@ fi
 RESUME=0
 if [ -f "$RUN_JSON" ]; then
   jq -e --argjson v "$SCHEMA_VERSION" '.schema_version == $v' "$RUN_JSON" >/dev/null 2>&1 \
-    || die "$RUN_JSON is not a schema_version $SCHEMA_VERSION run record. Move .interrogate/ aside to start a new assessment."
+    || die "$RUN_JSON is not a schema_version $SCHEMA_VERSION run record. Move $OUT/ aside to start a new assessment."
   RESUME=1
   rec_git="$(jq -r '.target.is_git' "$RUN_JSON")"
   rec_commit="$(jq -r '.target.commit // empty' "$RUN_JSON")"
@@ -557,7 +572,7 @@ if [ -f "$RUN_JSON" ]; then
     die "$RUN_JSON records a git target, but $TARGET_ABS is no longer a git repository."
   fi
   if [ "$rec_git" = "false" ] && [ "$IN_GIT" -eq 1 ]; then
-    die "$RUN_JSON records a non-git target, but $TARGET_ABS is now a git repository. Move .interrogate/ aside to start a new assessment pinned to a commit."
+    die "$RUN_JSON records a non-git target, but $TARGET_ABS is now a git repository. Move $OUT/ aside to start a new assessment pinned to a commit."
   fi
   if [ "$IN_GIT" -eq 1 ] && [ "$HEAD_SHA" != "$rec_commit" ]; then
     # --commit moves HEAD with the runner's own commits. Allow exactly that:
@@ -567,15 +582,15 @@ if [ -f "$RUN_JSON" ]; then
     if git merge-base --is-ancestor "$rec_commit" "$HEAD_SHA" 2>/dev/null; then
       for c in $(git rev-list "$rec_commit..$HEAD_SHA"); do
         jq -e --arg c "$c" '(.runner_commits // []) | index($c) != null' "$RUN_JSON" >/dev/null || { ok=0; break; }
-        if git diff-tree --no-commit-id --name-only -r "$c" | grep -v -e "^${PREFIX}\.interrogate/" -e "^${PREFIX}ARCHITECTURE\.md\$" >/dev/null; then ok=0; break; fi
+        if git diff-tree --no-commit-id --name-only -r "$c" | grep -v -e "^${PREFIX}${OUT_RE}/" -e "^${PREFIX}ARCHITECTURE\.md\$" >/dev/null; then ok=0; break; fi
       done
     else
       ok=0
     fi
     if [ "$ok" -eq 0 ]; then
-      die "HEAD is now ${HEAD_SHA:0:12}, but the notes in .interrogate/ were written against ${rec_commit:0:12} (run.json). Resuming would mix findings from two revisions.
+      die "HEAD is now ${HEAD_SHA:0:12}, but the notes in $OUT/ were written against ${rec_commit:0:12} (run.json). Resuming would mix findings from two revisions.
   To continue the existing assessment: git checkout ${rec_commit:0:12}
-  To assess the new revision: move .interrogate/ aside and run again."
+  To assess the new revision: move $OUT/ aside and run again."
     fi
   fi
 fi
@@ -584,7 +599,8 @@ fi
 DIRTY=0
 DIRTY_PATHS='[]'
 if [ "$IN_GIT" -eq 1 ]; then
-  excl=(":(top,exclude)${PREFIX}.interrogate")
+  # Every notes directory is excluded: the default one and this run's.
+  excl=(":(top,exclude)${PREFIX}.interrogate" ":(top,exclude)${PREFIX}$OUT")
   if [ "$RESUME" -eq 1 ] && jq -e '.architecture_md.written_by_run == true' "$RUN_JSON" >/dev/null 2>&1; then
     excl+=(":(top,exclude)${PREFIX}ARCHITECTURE.md")
   fi
@@ -624,15 +640,15 @@ in_steps() { case " $STEPS " in *" $1 "*) return 0 ;; esac; return 1; }
 PLANTED=""
 PLANTED_JSON='{}'
 if [ "$IN_GIT" -eq 1 ]; then
-  for f in $(for s in $ALL_STEPS; do echo ".interrogate/$(note_for "$s")"; done) \
-           .interrogate/CLAUDE.proposed.md .interrogate/ARCHITECTURE.proposed.md "$RUN_JSON" "$CIT_JSON"; do
+  for f in $(for s in $ALL_STEPS; do echo "$OUT/$(note_for "$s")"; done) \
+           "$OUT/CLAUDE.proposed.md" "$OUT/ARCHITECTURE.proposed.md" "$RUN_JSON" "$CIT_JSON"; do
     [ -e "$f" ] || continue
     fc="$(foreign_commits "$f")"
     [ -n "$fc" ] || continue
     # A notes file that this run will overwrite with --force is not trusted
     # either way, so it doesn't block.
     for s in $ALL_STEPS; do
-      if [ "$f" = ".interrogate/$(note_for "$s")" ] && [ "$FORCE" -eq 1 ] && in_steps "$s"; then fc=""; fi
+      if [ "$f" = "$OUT/$(note_for "$s")" ] && [ "$FORCE" -eq 1 ] && in_steps "$s"; then fc=""; fi
     done
     [ -n "$fc" ] || continue
     nfc="$(printf '%s\n' "$fc" | wc -l | tr -d ' ')"
@@ -678,9 +694,9 @@ fi
 # write files. Claude Code decides what is read-only, and the version is
 # recorded in run.json; if a later version stops treating one of these as
 # read-only, dontAsk denies it and the step works with less history.
-BASE_ALLOW='Edit(/.interrogate/**)'
+BASE_ALLOW="Edit(/$OUT/**)"
 # The runner's own records. A deny rule wins over the allow above.
-BASE_DENY='Edit(/.interrogate/run.json),Edit(/.interrogate/citations.json)'
+BASE_DENY="Edit(/$RUN_JSON),Edit(/$CIT_JSON)"
 
 # ---------------------------------------------------------------------------
 # Initialise or extend run.json.
@@ -709,7 +725,7 @@ ARCH_GRANT=$((1 - ARCH_PRESENT))
 
 INVOCATION=0
 if [ "$DRY" -eq 0 ]; then
-  mkdir -p .interrogate
+  mkdir -p "$OUT"
   PLUGIN_INFO="$(plugin_json)"
   invocation="$(jq -c -n \
     --arg at "$(now_utc)" --arg ccv "$CLAUDE_VERSION" --argjson plugin "$PLUGIN_INFO" \
@@ -778,11 +794,11 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/interrogate.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# Hash every file under .interrogate/ except the runner's own records.
+# Hash every file under the notes directory except the runner's own records.
 snapshot() {
   : > "$1"
-  [ -d .interrogate ] || return 0
-  find .interrogate -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
+  [ -d "$OUT" ] || return 0
+  find "$OUT" -type f ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print | LC_ALL=C sort | while IFS= read -r f; do
     printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
   done > "$1"
 }
@@ -790,7 +806,7 @@ snapshot() {
 # Run check-citations and record the result. Returns its exit status.
 run_citation_check() {
   local scope="$1"; shift
-  local args=(--quiet --out "$CIT_JSON") rc
+  local args=(--quiet --dir "$OUT" --out "$CIT_JSON") rc
   if [ "$IN_GIT" -eq 1 ]; then
     args+=(--commit "$(jq -r '.target.commit' "$RUN_JSON")")
   else
@@ -851,7 +867,7 @@ adopt_note() {
 
 run_step() {
   step="$1"
-  note=".interrogate/$(note_for "$step")"
+  note="$OUT/$(note_for "$step")"
 
   if [ "$FORCE" -eq 0 ] && [ -s "$note" ]; then
     echo "== $step: $note exists, skipping (use --force to re-run)"
@@ -878,6 +894,11 @@ run_step() {
     --allowedTools "$allow" --disallowedTools "$deny" --output-format stream-json --verbose
   if [ "$TRUST" -eq 0 ]; then set -- "$@" --setting-sources user; fi
   if [ -n "$MODEL" ]; then set -- "$@" --model "$MODEL"; fi
+  # The skills name .interrogate/ as their notes directory. With --run-dir,
+  # tell the session where this run's notes are instead.
+  if [ "$OUT" != ".interrogate" ]; then
+    set -- "$@" --append-system-prompt "For this assessment run, the notes directory is $OUT/ (relative to the current working directory). Wherever the instructions say .interrogate/, read and write $OUT/ instead. Don't read or write notes anywhere else under .interrogate/."
+  fi
 
   echo "== $step"
   if [ "$DRY" -eq 1 ]; then
@@ -922,7 +943,7 @@ run_step() {
   # Files the step wrote: new, changed, or rewritten (newer than the marker).
   snapshot "$WORK/after"
   outputs="$(
-    { find .interrogate -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print 2>/dev/null
+    { find "$OUT" -type f -newer "$WORK/marker" ! -path "$RUN_JSON" ! -path "$CIT_JSON" ! -name '*.tmp.*' -print 2>/dev/null
       awk -F'\t' 'NR == FNR { b[$1] = $2; next } b[$1] != $2 { print $1 }' "$WORK/before" "$WORK/after"
     } | LC_ALL=C sort -u | while IFS= read -r f; do
       [ -f "$f" ] && printf '%s\t%s\n' "$f" "$(sha256_file "$f")"
@@ -1000,7 +1021,7 @@ run_step() {
   fi
 
   if [ "$COMMIT" -eq 1 ]; then
-    git add -- .interrogate
+    git add -- "$OUT"
     if [ -f ARCHITECTURE.md ]; then git add -- ARCHITECTURE.md; fi
     if ! git diff --cached --quiet; then
       git commit -q -m "interrogate: $step"
@@ -1016,13 +1037,13 @@ run_step() {
 if [ "$DRY" -eq 0 ] && [ "$NO_VERIFY" -eq 0 ]; then
   keep=()
   for s in $ALL_STEPS; do
-    n=".interrogate/$(note_for "$s")"
+    n="$OUT/$(note_for "$s")"
     [ -s "$n" ] || continue
     if [ "$FORCE" -eq 1 ] && in_steps "$s"; then continue; fi
     keep+=("$n")
   done
   if ! { [ "$FORCE" -eq 1 ] && in_steps capture; }; then
-    for n in .interrogate/CLAUDE.proposed.md .interrogate/ARCHITECTURE.proposed.md; do
+    for n in "$OUT/CLAUDE.proposed.md" "$OUT/ARCHITECTURE.proposed.md"; do
       [ -s "$n" ] && keep+=("$n")
     done
   fi
@@ -1039,7 +1060,7 @@ done
 
 if [ "$DRY" -eq 0 ]; then
   echo
-  echo "Notes are in $(pwd)/.interrogate/"
+  echo "Notes are in $(pwd)/$OUT/"
   echo "Run record: $(pwd)/$RUN_JSON"
   if [ -f ARCHITECTURE.md ]; then echo "Assessment: $(pwd)/ARCHITECTURE.md"; fi
 fi
