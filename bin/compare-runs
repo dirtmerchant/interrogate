@@ -75,6 +75,7 @@ for d in "${DIRS[@]}"; do
       citations_current: ((.citation_checks // []) | (length > 0 and .[-1].citations_json_sha256 == $h)),
       steps: [.steps[] | select(.status == "completed") | {step, model, effort_requested, skill_sha256, session_id, cost_usd}],
       citations: $c[0].citations,
+      notes_files: ($c[0].files // []),
       indexes: ($c[0].indexes // []),
       notes_dir: (.invocations[-1].options.run_dir // ".interrogate")
     }' "$d/run.json" >> "$W/runs"
@@ -133,7 +134,7 @@ def rank_agreement($a; $b):
           | ([$runs[] | [.steps[] | select(.step == $s)] | last | .model] | map(select(. != null)) | unique) as $m
           | select(($m | length) > 1) | "\($s): runs used different models: \($m | join(", "))"]
       + [$allsteps[] as $s
-          | ([$runs[] | [.steps[] | select(.step == $s)] | last | (.effort_requested // "default")] | unique) as $e
+          | ([$runs[] | [.steps[] | select(.step == $s)] | select(length > 0) | last | (.effort_requested // "default")] | unique) as $e
           | select(($e | length) > 1) | "\($s): runs used different effort levels: \($e | join(", "))"]
     ),
     steps: ([$allsteps[] as $s
@@ -141,8 +142,14 @@ def rank_agreement($a; $b):
       | select(($have | length) >= 2)
       | ($have | map(. as $i | $cites[$i] | map(select(.step == $s)))) as $sc
       | ($sc | map(map(.path) | unique)) as $files
+      | ($have | map(. as $i | $runs[$i].notes_files | map(select(step_of(.path) == $s)) | map(.sha256) | sort)) as $nh
+      | ([$runs[] | select(any(.steps[]; .step == $s))] | length) as $ran
       | {key: $s, value: {
           runs: ($have | length),
+          runs_that_ran_the_step: $ran,
+          # Byte-identical notes (for example, copied into each run
+          # directory) agree trivially; say so rather than report 100%.
+          notes_identical: (($nh | unique | length) == 1),
           file_agreement: ([pairs($sc | length)[] as [$i, $j] | jaccard($files[$i]; $files[$j])] | map(select(. != null)) | mean),
           line_agreement: ([pairs($sc | length)[] as [$i, $j]
               | (if ($sc[$i] | length) > 0 then ([$sc[$i][] | select(overlaps(.; $sc[$j]))] | length) / ($sc[$i] | length) else empty end),
@@ -202,15 +209,23 @@ printf '%s\n' "$report" | jq -r --arg out "$OUTFILE" '
   "",
   (if (.warnings | length) > 0 then ("Warnings:", (.warnings[] | "  - \(.)"), "") else empty end),
   "Citations by step (pass citations of code only):",
-  (.steps | to_entries[] | "  \(.key | . + "          " | .[0:11]) files \(.value.file_agreement | pct)  lines \(.value.line_agreement | pct)  citations per run \(.value.citations_per_run | map(tostring) | join("/"))  files in every run \(.value.files_in_every_run | length), in one run \(.value.files_in_one_run | length)"),
+  (.steps | to_entries[] | if .value.notes_identical then
+      "  \(.key | . + "          " | .[0:11]) identical notes in every run (copied, or run once): agreement is trivial, not measured"
+    else
+      "  \(.key | . + "          " | .[0:11]) files \(.value.file_agreement | pct)  lines \(.value.line_agreement | pct)  citations per run \(.value.citations_per_run | map(tostring) | join("/"))  files in every run \(.value.files_in_every_run | length), in one run \(.value.files_in_one_run | length)"
+    end),
   "",
-  (if .hotspots.compared then
+  (if .hotspots.compared and (.steps.hotspots.notes_identical // false) then
+    "Hotspots: the hotspots notes are identical in every run (copied, or run once), so their agreement is trivial, not measured"
+   elif .hotspots.compared then
     ("Hotspots (\(.hotspots.runs) runs): overlap \(.hotspots.overlap | pct), rank agreement \(.hotspots.rank_agreement | if . == null then "n/a" else (. * 100 | round / 100 | tostring) end) (1 = same order, -1 = reversed)",
      "  in every run: \(.hotspots.in_every_run | join(", ") | if . == "" then "none" else . end)",
      "  in one run:   \(.hotspots.in_one_run | join(", ") | if . == "" then "none" else . end)")
    else "Hotspots: not compared (\(.hotspots.reason))" end),
   "",
-  (if .patterns.compared then
+  (if .patterns.compared and (.steps.patterns.notes_identical // false) then
+    "Patterns: the patterns notes are identical in every run (copied, or run once), so their agreement is trivial, not measured"
+   elif .patterns.compared then
     ("Patterns (\(.patterns.runs) runs): found in every run \(.patterns.in_every_run | length), status agreement among them \(.patterns.status_agreement | pct)",
      (.patterns.in_every_run[] | "  \(if .status_agrees then "same  " else "DIFFER" end) \(.pattern): \(.statuses | join(" / ")), violations \(.violations | map(tostring) | join(" / "))"),
      (.patterns.in_some_runs[] | "  some   \(.pattern): in \(.runs) of the runs (\(.statuses | join(" / ")))"))
