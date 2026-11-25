@@ -936,7 +936,7 @@ run_step() {
   if provider_mismatch "$reported"; then mismatch=true; fi
 
   status="completed"
-  if [ "$rc" -ne 0 ] || [ "$(jq -r '.is_error // false' <<<"$result")" = "true" ]; then
+  if [ "$rc" -ne 0 ] || [ "$(jq -r '.is_error' <<<"$result")" = "true" ]; then
     status="failed"
   elif [ ! -s "$note" ]; then
     status="failed: notes not written"
@@ -950,10 +950,12 @@ run_step() {
     --arg allow "$allow" --arg deny "$deny" --argjson outputs "$outputs" \
     --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" '
     def nz: if . == "" then null else . end;
+    # jq'"'"'s // treats false as missing, so booleans are read with has().
+    def field($o; $k; $d): if ($o | has($k)) then $o[$k] else $d end;
     {
       step: $step, invocation: $inv, status: $status,
       started_at: $started, ended_at: $ended, exit_status: $rc,
-      is_error: ($result.is_error // null),
+      is_error: field($result; "is_error"; "unknown"),
       session_id: ($result.session_id // $init.session_id // "unknown"),
       cost_usd: ($result.total_cost_usd // "unknown"),
       model_requested: ($model_req | nz),
@@ -961,7 +963,7 @@ run_step() {
       models_used: (($result.modelUsage // {}) | with_entries(.value |= {cost_usd: .costUSD, provider: (.provider // "unknown")})),
       provider_reported: $reported,
       provider_mismatch: $mismatch,
-      served_by_anthropic: ($init.served_by_anthropic // "unknown"),
+      served_by_anthropic: field($init; "served_by_anthropic"; "unknown"),
       permission_denials: (($result.permission_denials // []) | map({tool: .tool_name, command: (.tool_input.command // .tool_input.file_path // null | if type == "string" then .[0:300] else . end)})),
       skill_sha256: $skill,
       allowed_tools: ($allow | split(",")),
