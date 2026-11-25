@@ -894,9 +894,10 @@ run_step() {
   # ran on; the final result event carries the session ID, cost, per-model
   # usage, and the result text. Tool calls are echoed as progress.
   set +e
-  "$@" </dev/null | tee "$WORK/$step.jsonl" | jq -rR --unbuffered '
+  "$@" </dev/null | tee "$WORK/$step.jsonl" | jq -rR --unbuffered --arg root "$TARGET_ABS/" '
     fromjson? | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use")
-    | "   . \(.name) \(.input.file_path // .input.path // .input.pattern // .input.command // .input.description // "" | tostring | .[0:110])"'
+    | (.input.file_path // .input.path // .input.pattern // .input.command // .input.description // "" | tostring) as $a
+    | "   . \(.name) \(if ($a | startswith($root)) then $a[($root | length):] else $a end | if . == "" then "." else . end | .[0:110])"'
   rcs=("${PIPESTATUS[@]}")
   set -e
   rc="${rcs[0]}"
@@ -958,7 +959,7 @@ run_step() {
       provider_reported: $reported,
       provider_mismatch: $mismatch,
       served_by_anthropic: ($init.served_by_anthropic // "unknown"),
-      permission_denials: (($result.permission_denials // []) | length),
+      permission_denials: (($result.permission_denials // []) | map({tool: .tool_name, command: (.tool_input.command // .tool_input.file_path // null | if type == "string" then .[0:300] else . end)})),
       skill_sha256: $skill,
       allowed_tools: ($allow | split(",")),
       disallowed_tools: ($deny | split(",")),
