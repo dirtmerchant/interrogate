@@ -52,6 +52,9 @@ Options:
                      Refuse to start unless the model provider is this one:
                      anthropic, bedrock, google-cloud, foundry, or other.
   --no-verify        Don't run check-citations after each step.
+  --trust-notes      Accept notes files that are tracked in the target's git
+                     history as completed steps. Without it the run refuses,
+                     because a committed notes file may not come from a run.
   --dry-run          Print the commands without running them.
   --verify           Don't run anything. Recompute the hashes in run.json
                      and report any file that no longer matches.
@@ -84,6 +87,7 @@ DRY=0
 ALLOW_DIRTY=0
 REQUIRE_PROVIDER=""
 NO_VERIFY=0
+TRUST_NOTES=0
 VERIFY=0
 TARGET=""
 
@@ -98,6 +102,7 @@ while [ $# -gt 0 ]; do
     --allow-dirty)      ALLOW_DIRTY=1; shift ;;
     --require-provider) REQUIRE_PROVIDER="${2:?--require-provider needs a value}"; shift 2 ;;
     --no-verify)        NO_VERIFY=1; shift ;;
+    --trust-notes)      TRUST_NOTES=1; shift ;;
     --dry-run)          DRY=1; shift ;;
     --verify)           VERIFY=1; shift ;;
     -h|--help)          usage; exit 0 ;;
@@ -596,6 +601,54 @@ if [ "$IN_GIT" -eq 1 ]; then
   fi
 fi
 
+# Planted notes. Resume treats an existing notes file as a finished step, so
+# a notes file committed to the target's history (by anyone) would be taken
+# as a finding this run produced. Refuse that unless --trust-notes is passed.
+# The runner's own --commit commits are exempt: they are listed in run.json
+# and must come after the pinned commit.
+foreign_commits() {
+  local f="$1" c rec=""
+  [ "$RESUME" -eq 1 ] && rec="$(jq -r '.target.commit // empty' "$RUN_JSON")"
+  git log --format=%H -- "$f" 2>/dev/null | while IFS= read -r c; do
+    if [ -n "$rec" ] && [ "$c" != "$rec" ] \
+      && jq -e --arg c "$c" '(.runner_commits // []) | index($c) != null' "$RUN_JSON" >/dev/null \
+      && git merge-base --is-ancestor "$rec" "$c" 2>/dev/null; then
+      continue
+    fi
+    echo "$c"
+  done
+}
+
+in_steps() { case " $STEPS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+PLANTED=""
+PLANTED_JSON='{}'
+if [ "$IN_GIT" -eq 1 ]; then
+  for f in $(for s in $ALL_STEPS; do echo ".interrogate/$(note_for "$s")"; done) \
+           .interrogate/CLAUDE.proposed.md .interrogate/ARCHITECTURE.proposed.md "$RUN_JSON" "$CIT_JSON"; do
+    [ -e "$f" ] || continue
+    fc="$(foreign_commits "$f")"
+    [ -n "$fc" ] || continue
+    # A notes file that this run will overwrite with --force is not trusted
+    # either way, so it doesn't block.
+    for s in $ALL_STEPS; do
+      if [ "$f" = ".interrogate/$(note_for "$s")" ] && [ "$FORCE" -eq 1 ] && in_steps "$s"; then fc=""; fi
+    done
+    [ -n "$fc" ] || continue
+    PLANTED="$PLANTED
+  $f  (in commit $(echo "$fc" | head -n1 | cut -c1-12)$( [ "$(echo "$fc" | wc -l)" -gt 1 ] && echo " and $(($(echo "$fc" | wc -l) - 1)) more"))"
+    PLANTED_JSON="$(jq -c --arg f "$f" --arg c "$fc" '. + {($f): ($c | split("\n") | map(select(length > 0)))}' <<<"$PLANTED_JSON")"
+  done
+fi
+if [ -n "$PLANTED" ]; then
+  if [ "$TRUST_NOTES" -eq 0 ]; then
+    die "these files are tracked in the target's git history, in commits this runner didn't make:$PLANTED
+  A committed notes file may not come from an assessment at all, so it won't be treated as a completed step.
+  Re-run those steps with --force to replace them, or pass --trust-notes to accept them (recorded in run.json)."
+  fi
+  echo "== accepting notes tracked in git history because of --trust-notes:$PLANTED"
+fi
+
 if [ "$COMMIT" -eq 1 ]; then
   [ "$IN_GIT" -eq 1 ] || DIE_STATUS=2 die "--commit needs a git repository"
   branch="$(git symbolic-ref --short -q HEAD || true)"
@@ -611,7 +664,18 @@ fi
 # Everything not listed here that would need approval is denied by
 # --permission-mode dontAsk. File reads, searches, and Claude Code's built-in
 # read-only shell commands need no approval, so they still run.
-BASE_ALLOW='Edit(/.interrogate/**),Bash(git log *),Bash(git show *),Bash(git ls-files *),Bash(git blame *),Bash(git shortlog *),Bash(sort),Bash(sort -rn),Bash(sort -nr),Bash(uniq),Bash(uniq -c)'
+#
+# No Bash rules are needed. Tested with Claude Code 2.1.332 in dontAsk mode
+# and no allow rules: every git command the hotspots step uses (git log
+# --format/--name-only/--follow, git show --stat, git ls-files, git blame,
+# git shortlog) and its "sort | uniq -c | sort -rn | head" pipeline ran as
+# built-in read-only commands, while "git log --output=<file>" and
+# "git show --output=<file>" were denied. The rules this replaces,
+# Bash(git log *) and Bash(git show *), approved the --output forms, which
+# write files. Claude Code decides what is read-only, and the version is
+# recorded in run.json; if a later version stops treating one of these as
+# read-only, dontAsk denies it and the step works with less history.
+BASE_ALLOW='Edit(/.interrogate/**)'
 # The runner's own records. A deny rule wins over the allow above.
 BASE_DENY='Edit(/.interrogate/run.json),Edit(/.interrogate/citations.json)'
 
@@ -633,9 +697,12 @@ plugin_json() {
     '{version: $v, commit: $c, dirty: $d, skills: $sk}'
 }
 
+# The capture step is told to leave an existing ARCHITECTURE.md alone. Make
+# that a rule rather than a request: grant the write only when the file is
+# absent at the start of this run, and deny it otherwise.
 ARCH_PRESENT=0
 [ -e ARCHITECTURE.md ] && ARCH_PRESENT=1
-ARCH_GRANT=1
+ARCH_GRANT=$((1 - ARCH_PRESENT))
 
 INVOCATION=0
 if [ "$DRY" -eq 0 ]; then
@@ -647,6 +714,7 @@ if [ "$DRY" -eq 0 ]; then
     --arg allow "$BASE_ALLOW" --arg deny "$BASE_DENY" \
     --argjson trust "$TRUST" --argjson dirty "$DIRTY" --argjson allow_dirty "$ALLOW_DIRTY" \
     --argjson no_verify "$NO_VERIFY" --argjson force "$FORCE" --argjson commit "$COMMIT" \
+    --argjson trust_notes "$TRUST_NOTES" --argjson planted "$PLANTED_JSON" \
     --arg steps "$STEPS" --arg model "$MODEL" --arg feature "$FEATURE" --arg head "$HEAD_SHA" \
     --argjson dirty_paths "$DIRTY_PATHS" --argjson arch_present "$ARCH_PRESENT" --argjson arch_grant "$ARCH_GRANT" '
     def nz: if . == "" then null else . end;
@@ -664,10 +732,11 @@ if [ "$DRY" -eq 0 ]; then
       options: {
         steps: ($steps | split(" ") | map(select(length > 0))),
         force: ($force == 1), commit: ($commit == 1), trust_project: ($trust == 1),
-        allow_dirty: ($allow_dirty == 1), no_verify: ($no_verify == 1),
+        allow_dirty: ($allow_dirty == 1), no_verify: ($no_verify == 1), trust_notes: ($trust_notes == 1),
         model_requested: ($model | nz), feature: ($feature | nz)
       },
       target_state: {head: ($head | nz), dirty: ($dirty == 1), dirty_paths: $dirty_paths},
+      notes_tracked_in_git: $planted,
       architecture_md: {present_at_start: ($arch_present == 1), write_granted: ($arch_grant == 1)}
     }')"
 
@@ -758,12 +827,32 @@ provider_mismatch() {
   esac
 }
 
+# Record a notes file that resume is treating as a finished step. If it
+# matches what an earlier step recorded, there's nothing new to say.
+adopt_note() {
+  local step="$1" note="$2" h last
+  h="$(sha256_file "$note")"
+  last="$(jq -r --arg p "$note" '[.steps[] | (.outputs // [])[] | select(.path == $p) | .sha256] | last // empty' "$RUN_JSON")"
+  [ "$h" != "$last" ] || return 0
+  if [ -n "$last" ]; then
+    echo "   note: $note has changed since run.json recorded it; --verify will report it"
+    reason="exists; differs from the hash an earlier step recorded"
+  else
+    reason="exists; not written by any step in this run.json"
+  fi
+  rj_write '.steps += [{step: $s, invocation: $inv, status: "adopted", reason: $r,
+      at: $now, outputs: [{path: $p, sha256: $h}], tracked_in_git: ($pl[$p] // [])}]' \
+    --arg s "$step" --argjson inv "$INVOCATION" --arg r "$reason" --arg p "$note" --arg h "$h" \
+    --argjson pl "$PLANTED_JSON"
+}
+
 run_step() {
   step="$1"
   note=".interrogate/$(note_for "$step")"
 
   if [ "$FORCE" -eq 0 ] && [ -s "$note" ]; then
     echo "== $step: $note exists, skipping (use --force to re-run)"
+    [ "$DRY" -eq 0 ] && adopt_note "$step" "$note"
     return 0
   fi
 
@@ -775,7 +864,11 @@ run_step() {
   allow="$BASE_ALLOW"
   deny="$BASE_DENY"
   if [ "$step" = "capture" ]; then
-    allow="$allow,Edit(/ARCHITECTURE.md)"
+    if [ "$ARCH_GRANT" -eq 1 ]; then
+      allow="$allow,Edit(/ARCHITECTURE.md)"
+    else
+      deny="$deny,Edit(/ARCHITECTURE.md)"
+    fi
   fi
 
   set -- claude -p "$prompt" --plugin-dir "$PLUGIN_ROOT" --permission-mode dontAsk \
@@ -910,8 +1003,6 @@ run_step() {
     fi
   fi
 }
-
-in_steps() { case " $STEPS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Notes kept from an earlier invocation are checked once up front, because
 # later steps build on them and resume would otherwise skip straight past a
