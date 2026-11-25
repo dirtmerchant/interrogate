@@ -29,3 +29,34 @@ write_atomic() {
   tmp="$dest.tmp.$$"
   cat > "$tmp" && mv -f "$tmp" "$dest"
 }
+
+# Language from a file path, by extension. An awk function, so callers can
+# classify thousands of paths in one process. Languages whose imports
+# bin/measure extracts are listed in MEASURED_LANGS.
+LANG_FOR_AWK='
+function lang_for(p,    b, e) {
+  b = p; sub(/.*\//, "", b)
+  if (b == "Dockerfile" || b ~ /^Dockerfile\./) return "dockerfile"
+  if (b == "Makefile" || b == "GNUmakefile") return "make"
+  e = b; if (e !~ /\./) return "other"
+  sub(/.*\./, "", e); e = tolower(e)
+  if (e == "py" || e == "pyi") return "python"
+  if (e == "ts" || e == "tsx" || e == "mts" || e == "cts") return "typescript"
+  if (e == "js" || e == "jsx" || e == "mjs" || e == "cjs") return "javascript"
+  if (e == "go") return "go"
+  if (e == "java") return "java"
+  if (e == "kt" || e == "kts") return "kotlin"
+  if (e == "rb") return "ruby"
+  if (e == "cs") return "csharp"
+  if (e == "rs") return "rust"
+  if (e == "php") return "php"
+  if (e == "swift") return "swift"
+  if (e == "scala") return "scala"
+  if (e == "c" || e == "h") return "c"
+  if (e == "cc" || e == "cpp" || e == "cxx" || e == "hpp" || e == "hh") return "cpp"
+  if (e == "sh" || e == "bash" || e == "zsh") return "shell"
+  if (e == "md" || e == "rst" || e == "txt" || e == "adoc") return "docs"
+  if (e == "json" || e == "yaml" || e == "yml" || e == "toml" || e == "ini" || e == "cfg" || e == "xml") return "config"
+  return "other"
+}'
+MEASURED_LANGS="python javascript typescript go java kotlin"

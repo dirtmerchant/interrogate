@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# Measure a repository at one commit: file sizes, churn, co-change, imports,
+# fan-in, and enforcement mechanisms. No model is involved. The numbers come
+# from git's object store at the pinned commit, never from the working tree,
+# so the same commit always gives byte-identical output.
+#
+# These are measurements, not findings. The assessment steps cite rows of
+# these files when they state a number, and check-citations confirms that
+# each cited row exists. What the numbers mean is still the model's
+# judgment, and the reader's.
+#
+# Needs bash 3.2+, git, awk, and jq.
+set -euo pipefail
+
+SELF="measure"
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$PLUGIN_ROOT/lib/common.sh"
+
+WINDOW_DAYS=365
+BULK_FILES=50
+MIN_TOGETHER=3
+
+usage() {
+  cat <<EOF
+Usage: measure [options] [target-dir]
+
+Writes deterministic measurements of target-dir at one commit to
+<dir>/metrics/: files.tsv, churn.tsv, cochange.tsv, imports.tsv, fanin.tsv,
+enforcement.tsv, and summary.json.
+
+Options:
+  --commit SHA   Measure this commit (default: target.commit in
+                 <dir>/run.json, else HEAD).
+  --dir DIR      Notes directory, relative to target-dir (default .interrogate).
+  --out DIR      Output directory (default <dir>/metrics).
+  -h, --help     Show this help.
+
+The churn window is the $WINDOW_DAYS days ending at the commit's committer
+date, not at today, so re-running later gives the same numbers. Co-change
+skips commits that touch more than $BULK_FILES files and keeps pairs that
+change together at least $MIN_TOGETHER times.
+EOF
+}
+
+COMMIT=""
+DIR=".interrogate"
+OUT=""
+TARGET=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --commit) COMMIT="${2:?--commit needs a value}"; shift 2 ;;
+    --dir)    DIR="${2:?--dir needs a value}"; shift 2 ;;
+    --out)    OUT="${2:?--out needs a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "$SELF: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *)  if [ -n "$TARGET" ]; then echo "$SELF: only one target directory" >&2; exit 2; fi
+        TARGET="$1"; shift ;;
+  esac
+done
+
+need_jq "$SELF"
+TARGET="${TARGET:-.}"
+[ -d "$TARGET" ] || { echo "$SELF: $TARGET is not a directory" >&2; exit 2; }
+cd "$TARGET"
+OUT="${OUT:-$DIR/metrics}"
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || { echo "$SELF: $TARGET is not a git repository; there is no commit to measure" >&2; exit 2; }
+PREFIX="$(git rev-parse --show-prefix)"
+if [ -z "$COMMIT" ] && [ -f "$DIR/run.json" ]; then
+  COMMIT="$(jq -r '.target.commit // empty' "$DIR/run.json" 2>/dev/null || true)"
+fi
+COMMIT="${COMMIT:-HEAD}"
+SHA="$(git rev-parse -q --verify "$COMMIT^{commit}" || true)"
+[ -n "$SHA" ] || { echo "$SELF: commit $COMMIT not found" >&2; exit 2; }
+
+W="$(mktemp -d "${TMPDIR:-/tmp}/measure.XXXXXX")"
+trap 'rm -rf "$W"' EXIT
+mkdir -p "$OUT"
+export LC_ALL=C
+
+END_TS="$(git show -s --format=%ct "$SHA")"
+START_TS=$((END_TS - WINDOW_DAYS * 86400))
+EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+
+# ---------------------------------------------------------------------------
+# files.tsv: every regular file at the commit, with its language and line
+# count. git decides what is binary (attributes, then content), and binary
+# files get "-" for lines. Symlinks and submodules are left out.
+# ---------------------------------------------------------------------------
+git ls-tree -r -z "$SHA" -- . | tr '\0' '\n' \
+  | awk -F'\t' '{ split($1, m, " "); if (m[1] == "100644" || m[1] == "100755") print $2 }' \
+  > "$W/regular"
+git diff --numstat -z --no-renames --no-textconv --no-ext-diff --relative "$EMPTY_TREE" "$SHA" -- . \
+  | tr '\0' '\n' | awk -F'\t' 'NF >= 3 { print $3 "\t" $1 }' > "$W/numstat"
+{
+  printf 'path\tlanguage\tlines\n'
+  awk -F'\t' "$LANG_FOR_AWK"'
+    NR == FNR { lines[$1] = $2; next }
+    { n = ($1 in lines) ? lines[$1] : 0; print $1 "\t" lang_for($1) "\t" n }
+  ' "$W/numstat" "$W/regular" | sort
+} > "$W/files.tsv"
+
+# ---------------------------------------------------------------------------
+# History. One pass over git log, restricted to the target directory. Each
+# commit's header line starts with \001 so it can't be mistaken for a path.
+# Author emails are used only to count distinct authors in memory; they are
+# never written out.
+# ---------------------------------------------------------------------------
+git log --no-merges --relative --format='%x01%H %ct %aE' --name-only "$SHA" -- . > "$W/log"
+IS_SHALLOW="$(git rev-parse --is-shallow-repository 2>/dev/null || echo unknown)"
+
+# churn.tsv: one row per file present at the commit.
+{
+  printf 'path\tcommits_window\tcommits_all\tauthors_window\n'
+  awk -v start="$START_TS" -v end="$END_TS" '
+    FNR == NR { present[$0] = 1; next }
+    /^\001/ { split(substr($0, 2), h, " "); ts = h[2] + 0; who = h[3]; next }
+    $0 == "" { next }
+    {
+      all[$0]++
+      if (ts > start && ts <= end) {
+        win[$0]++
+        if (!(($0, who) in seen)) { seen[$0, who] = 1; authors[$0]++ }
+      }
+    }
+    END {
+      for (p in present) printf "%s\t%d\t%d\t%d\n", p, win[p], all[p], authors[p]
+    }
+  ' "$W/regular" "$W/log" | sort
+} > "$W/churn.tsv"
+
+# cochange.tsv: file pairs that change in the same commits within the window.
+# Commits touching more than BULK_FILES files (formatting passes, vendoring,
+# mass renames) are skipped. confidence = together / min(support_a, support_b).
+{
+  printf 'a\tb\ttogether\tsupport_a\tsupport_b\tconfidence\n'
+  awk -v start="$START_TS" -v end="$END_TS" -v bulk="$BULK_FILES" -v min="$MIN_TOGETHER" '
+    function flush(   i, j, a, b) {
+      if (n > 0 && n <= bulk && inwin) {
+        for (i = 1; i <= n; i++) {
+          support[f[i]]++
+          for (j = 1; j <= n; j++) {
+            if (f[i] < f[j]) together[f[i], f[j]]++
+          }
+        }
+      }
+      n = 0
+    }
+    FNR == NR { present[$0] = 1; next }
+    /^\001/ { flush(); split(substr($0, 2), h, " "); ts = h[2] + 0; inwin = (ts > start && ts <= end); next }
+    $0 == "" { next }
+    ($0 in present) { f[++n] = $0 }
+    END {
+      flush()
+      for (k in together) {
+        if (together[k] < min) continue
+        split(k, ab, SUBSEP)
+        sa = support[ab[1]]; sb = support[ab[2]]
+        lo = (sa < sb) ? sa : sb
+        printf "%s\t%s\t%d\t%d\t%d\t%.2f\n", ab[1], ab[2], together[k], sa, sb, together[k] / lo
+      }
+    }
+  ' "$W/regular" "$W/log" | sort -t "$(printf '\t')" -k3,3nr -k1,1 -k2,2
+} > "$W/cochange.tsv"
+
+COMMITS_ALL="$(grep -c "$(printf '^\001')" "$W/log" || true)"
+COMMITS_WINDOW="$(awk -v start="$START_TS" -v end="$END_TS" '/^\001/ { split(substr($0, 2), h, " "); if (h[2] > start && h[2] <= end) c++ } END { print c + 0 }' "$W/log")"
+
+# ---------------------------------------------------------------------------
+# imports.tsv: one row per import statement in Python, JavaScript/TypeScript,
+# Go, Java, and Kotlin files, found with git grep on the commit's tree.
+# Each row is citable as from_path:line. kind is internal (resolved to a file
+# or package directory in the target), external (a third-party or standard
+# library import), or unresolved (looks internal but no file matched).
+#
+# This is a heuristic. It misses dynamic imports, tsconfig path aliases,
+# re-exports, Python namespace packages, and imports split across lines in
+# ways the patterns don't anticipate. It can match import-like text inside
+# strings or comments.
+# ---------------------------------------------------------------------------
+grep_lang() {
+  local tag="$1" re="$2"; shift 2
+  git grep -n -I -E -e "$re" "$SHA" -- "$@" 2>/dev/null | sed "s/^/$tag	/" || true
+}
+{
+  grep_lang py '^[[:space:]]*(from[[:space:]]+[.A-Za-z0-9_]+[[:space:]]+import[[:space:]]|import[[:space:]]+[A-Za-z_])' '*.py' '*.pyi'
+  grep_lang js '(from|require[[:space:]]*\(|import[[:space:]]*\(|^[[:space:]]*import)[[:space:]]*['"'"'"][^'"'"'"]+['"'"'"]' \
+    '*.js' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.mts' '*.cts'
+  grep_lang go '^(import([[:space:]]|\()|\)|[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*|\.|_)[[:space:]]+)?"[^"]+")' '*.go'
+  grep_lang jv '^[[:space:]]*import[[:space:]]+(static[[:space:]]+)?[A-Za-z_][A-Za-z0-9_.]*(\.\*)?' '*.java' '*.kt' '*.kts'
+} > "$W/grep"
+
+# Go modules: directory and module path of every go.mod in the target.
+: > "$W/gomods"
+awk -F'\t' '$1 == "go.mod" || $1 ~ /\/go\.mod$/ { print $1 }' "$W/files.tsv" | while IFS= read -r gm; do
+  mp="$(git cat-file -p "$SHA:./$gm" | awk '$1 == "module" { print $2; exit }')"
+  d="${gm%go.mod}"
+  [ -n "$mp" ] && printf '%s\t%s\n' "$d" "$mp" >> "$W/gomods"
+done
+
+git ls-tree --full-tree --name-only "$SHA" > "$W/toplevel"
+
+cat > "$W/imports.awk" <<'AWK'
+function dirname(p,   d) { d = p; if (d !~ /\//) return ""; sub(/\/[^\/]*$/, "", d); return d "/" }
+function normalize(p,   n, a, i, out, k, s) {
+  n = split(p, a, "/"); k = 0
+  for (i = 1; i <= n; i++) {
+    if (a[i] == "" || a[i] == ".") continue
+    if (a[i] == "..") { if (k == 0) return "\001"; k--; continue }
+    out[++k] = a[i]
+  }
+  s = ""; for (i = 1; i <= k; i++) s = s (i > 1 ? "/" : "") out[i]
+  return s
+}
+# Repository path to target path, or "" if it lies outside the target.
+function totarget(rp) {
+  if (prefix == "") return rp
+  if (index(rp, prefix) == 1) return substr(rp, length(prefix) + 1)
+  return ""
+}
+function isfile(tp) { return (tp != "" && (tp in file)) }
+function emit(from, line, target, resolved, kind) {
+  printf "%s\t%s\t%s\t%s\t%s\n", from, line, target, resolved, kind
+}
+
+# --- Python -----------------------------------------------------------------
+function py_try(base, rel,   rp, tp) {
+  rp = base rel
+  tp = totarget(rp ".py");          if (isfile(tp)) return tp
+  tp = totarget(rp "/__init__.py"); if (isfile(tp)) return tp
+  return ""
+}
+# Resolve a module name for an importer. Absolute names are tried from the
+# repository root, src/, and each directory above the importer.
+function py_resolve(importer, mod,   k, rest, base, i, rel, r, d) {
+  if (mod ~ /^\./) {
+    k = match(mod, /[^.]/); if (k == 0) { k = length(mod) + 1 }
+    rest = substr(mod, k); k = k - 1
+    base = prefix dirname(importer)
+    for (i = 1; i < k; i++) { sub(/[^\/]*\/$/, "", base) }
+    rel = rest; gsub(/\./, "/", rel)
+    if (rel == "") { r = totarget(base "__init__.py"); return isfile(r) ? r : "" }
+    return py_try(base, rel)
+  }
+  rel = mod; gsub(/\./, "/", rel)
+  r = py_try("", rel); if (r != "") return r
+  r = py_try("src/", rel); if (r != "") return r
+  d = prefix dirname(importer)
+  while (d != "") {
+    r = py_try(d, rel); if (r != "") return r
+    sub(/[^\/]*\/$/, "", d)
+  }
+  return ""
+}
+function py_kind(mod, resolved,   top) {
+  if (resolved != "") return "internal"
+  if (mod ~ /^\./) return "unresolved"
+  top = mod; sub(/\..*/, "", top)
+  # A top-level name that exists in the repository (inside or outside the
+  # target) is the repository's own code, so it's unresolved, not external.
+  if ((top in topdir) || ((top ".py") in topfile) || (top in repotop) || ((top ".py") in repotop)) return "unresolved"
+  return "external"
+}
+function py_line(from, line, c,   m, names, n, i, nm, mod, any, r, parts) {
+  sub(/#.*/, "", c)
+  if (match(c, /^[ \t]*from[ \t]+[.A-Za-z0-9_]+[ \t]+import[ \t]+/)) {
+    m = c; sub(/^[ \t]*from[ \t]+/, "", m); mod = m; sub(/[ \t].*/, "", mod)
+    names = substr(c, RSTART + RLENGTH); gsub(/[()\\]/, " ", names)
+    n = split(names, parts, ",")
+    any = 0
+    for (i = 1; i <= n; i++) {
+      nm = parts[i]; sub(/^[ \t]+/, "", nm); sub(/[ \t].*/, "", nm)
+      if (nm == "" || nm == "*") continue
+      r = py_resolve(from, (mod ~ /\.$/) ? mod nm : mod "." nm)
+      if (r != "") { emit(from, line, (mod ~ /\.$/) ? mod nm : mod "." nm, r, "internal"); any = 1 }
+    }
+    if (!any) { r = py_resolve(from, mod); emit(from, line, mod, r, py_kind(mod, r)) }
+    return
+  }
+  m = c; sub(/^[ \t]*import[ \t]+/, "", m)
+  n = split(m, parts, ",")
+  for (i = 1; i <= n; i++) {
+    nm = parts[i]; sub(/^[ \t]+/, "", nm); sub(/[ \t].*/, "", nm)
+    if (nm !~ /^[A-Za-z_][A-Za-z0-9_.]*$/) continue
+    r = py_resolve(from, nm); emit(from, line, nm, r, py_kind(nm, r))
+  }
+}
+
+# --- JavaScript / TypeScript --------------------------------------------------
+function js_resolve(from, spec,   base, p, i, ext, n, alt) {
+  base = normalize(dirname(from) spec)
+  if (base == "\001") return ""
+  if (isfile(base)) return base
+  n = split(".ts .tsx .js .jsx .mjs .cjs .mts .cts .d.ts", ext, " ")
+  for (i = 1; i <= n; i++) if (isfile(base ext[i])) return base ext[i]
+  for (i = 1; i <= n; i++) if (isfile(base "/index" ext[i])) return base "/index" ext[i]
+  # ESM TypeScript imports name the compiled .js file; the source is .ts.
+  if (base ~ /\.(m|c)?js$/) {
+    alt = base; sub(/js$/, "ts", alt); if (isfile(alt)) return alt
+    alt = base; sub(/\.js$/, ".tsx", alt); if (isfile(alt)) return alt
+  }
+  return ""
+}
+function js_line(from, line, c,   s, q, spec, r) {
+  s = c
+  while (match(s, /(from|require[ \t]*\(|import[ \t]*\(|import)[ \t]*['"][^'"]+['"]/)) {
+    q = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+    match(q, /['"][^'"]+['"]/); spec = substr(q, RSTART + 1, RLENGTH - 2)
+    if (spec ~ /^\.\.?\//) { r = js_resolve(from, spec); emit(from, line, spec, r, r != "" ? "internal" : "unresolved") }
+    else if (spec ~ /^(@\/|~\/|#|\/)/) emit(from, line, spec, "", "unresolved")
+    else emit(from, line, spec, "", "external")
+  }
+}
+
+# --- Go -------------------------------------------------------------------------
+function go_import(from, line, path,   i, best, bl, d, sub_, td) {
+  best = ""; bl = 0
+  for (i = 1; i <= ngm; i++) {
+    if ((path == gmpath[i] || index(path, gmpath[i] "/") == 1) && length(gmpath[i]) > bl) { best = i; bl = length(gmpath[i]) }
+  }
+  if (best != "") {
+    sub_ = substr(path, bl + 2)
+    d = gmdir[best] sub_
+    if (d != "" && d !~ /\/$/) d = d "/"
+    td = d; sub(/\/$/, "", td)
+    if (d == "" || (td in dir)) emit(from, line, path, (d == "" ? "./" : d), "internal")
+    else emit(from, line, path, "", "unresolved")
+    return
+  }
+  emit(from, line, path, "", "external")
+}
+function go_line(from, line, c,   q) {
+  if (from != gofile) { gofile = from; inblock = 0 }
+  if (c ~ /^import[ \t]*\(/) { inblock = 1; return }
+  if (c ~ /^\)/) { inblock = 0; return }
+  if (c ~ /^import[ \t]/ || inblock) {
+    if (match(c, /"[^"]+"/)) { q = substr(c, RSTART + 1, RLENGTH - 2); go_import(from, line, q) }
+  }
+}
+
+# --- Java / Kotlin --------------------------------------------------------------
+function jv_suffix(suf,   b, list, n, i, cand) {
+  b = suf; sub(/.*\//, "", b)
+  if (!(b in byname)) return ""
+  n = split(byname[b], list, "\034")
+  for (i = 1; i <= n; i++) { cand = list[i]; if (cand == suf || substr(cand, length(cand) - length(suf)) == "/" suf) return cand }
+  return ""
+}
+function jv_dir(suf,   d) {
+  for (d in dir) if (d == suf || substr(d, length(d) - length(suf)) == "/" suf) return d "/"
+  return ""
+}
+function jv_line(from, line, c,   name, parts, n, k, rel, r, i) {
+  sub(/^[ \t]*import[ \t]+/, "", c); sub(/^static[ \t]+/, "", c)
+  name = c; sub(/[ \t;].*/, "", name)
+  if (name ~ /\.\*$/) {
+    rel = name; sub(/\.\*$/, "", rel); gsub(/\./, "/", rel)
+    r = jv_dir(rel); emit(from, line, name, r, r != "" ? "internal" : "external"); return
+  }
+  n = split(name, parts, ".")
+  # a.b.C, then a.b (for static members, nested classes, Kotlin functions).
+  for (k = n; k >= 2 && k >= n - 2; k--) {
+    rel = parts[1]; for (i = 2; i <= k; i++) rel = rel "/" parts[i]
+    r = jv_suffix(rel ".java"); if (r == "") r = jv_suffix(rel ".kt")
+    if (r != "") { emit(from, line, name, r, "internal"); return }
+  }
+  rel = parts[1]; for (i = 2; i < n; i++) rel = rel "/" parts[i]
+  r = jv_dir(rel)
+  emit(from, line, name, r, r != "" ? "internal" : "external")
+}
+
+BEGIN { FS = "\t" }
+FILENAME == files {
+  if (FNR == 1) next
+  file[$1] = 1
+  p = $1; b = p; sub(/.*\//, "", b)
+  if (b ~ /\.(java|kt)$/) byname[b] = (b in byname) ? byname[b] "\034" p : p
+  if (p !~ /\//) topfile[p] = 1
+  while (p ~ /\//) { sub(/\/[^\/]*$/, "", p); dir[p] = 1; if (p !~ /\//) topdir[p] = 1 }
+  next
+}
+FILENAME == gomods { ngm++; gmdir[ngm] = $1; gmpath[ngm] = $2; next }
+FILENAME == toplevel { repotop[$0] = 1; next }
+{
+  tag = $1; s = substr($0, length(tag) + 2)
+  s = substr(s, index(s, ":") + 1)          # drop "<sha>:"
+  from = substr(s, 1, index(s, ":") - 1); s = substr(s, index(s, ":") + 1)
+  line = substr(s, 1, index(s, ":") - 1); c = substr(s, index(s, ":") + 1)
+  if (tag == "py") py_line(from, line, c)
+  else if (tag == "js") js_line(from, line, c)
+  else if (tag == "go") go_line(from, line, c)
+  else if (tag == "jv") jv_line(from, line, c)
+}
+AWK
+
+{
+  printf 'from_path\tline\ttarget\tresolved_path\tkind\n'
+  awk -v prefix="$PREFIX" -v files="$W/files.tsv" -v gomods="$W/gomods" -v toplevel="$W/toplevel" -f "$W/imports.awk" \
+    "$W/files.tsv" "$W/gomods" "$W/toplevel" "$W/grep" | sort -t "$(printf '\t')" -k1,1 -k2,2n -k3,3
+} > "$W/imports.tsv"
+
+# fanin.tsv: for each internal file or package directory that is imported,
+# how many distinct files and distinct directories import it. Self-imports
+# don't count.
+{
+  printf 'path\tfanin_files\tfanin_modules\n'
+  awk -F'\t' '
+    function dirname(p,   d) { d = p; if (d !~ /\//) return "./"; sub(/\/[^\/]*$/, "", d); return d "/" }
+    NR == 1 || $5 != "internal" || $4 == "" || $4 == $1 { next }
+    !(($4, $1) in fs) { fs[$4, $1] = 1; ff[$4]++ }
+    !(($4, dirname($1)) in ms) { ms[$4, dirname($1)] = 1; fm[$4]++ }
+    END { for (t in ff) printf "%s\t%d\t%d\n", t, ff[t], fm[t] }
+  ' "$W/imports.tsv" | sort -t "$(printf '\t')" -k2,2nr -k1,1
+} > "$W/fanin.tsv"
+
+# ---------------------------------------------------------------------------
+# enforcement.tsv: mechanisms that can stop an architectural rule from being
+# broken, found by their configuration. Present is not the same as enforced:
+# whether CI actually runs a check is not visible from the tree.
+# ---------------------------------------------------------------------------
+grep_mech() {
+  local mech="$1" checks="$2" re="$3"; shift 3
+  git grep -n -I -E -e "$re" "$SHA" -- "$@" 2>/dev/null \
+    | awk -v m="$mech" -v c="$checks" '{ s = substr($0, index($0, ":") + 1); p = substr(s, 1, index(s, ":") - 1); s = substr(s, index(s, ":") + 1); l = substr(s, 1, index(s, ":") - 1); if (!((p) in seen)) { seen[p] = 1; print m "\t" p "\t" l "\t" c } }' || true
+}
+file_mech() {
+  local mech="$1" checks="$2" re="$3"
+  awk -F'\t' -v m="$mech" -v c="$checks" -v re="$re" 'NR > 1 && $1 ~ re { print m "\t" $1 "\t1\t" c }' "$W/files.tsv"
+}
+{
+  printf 'mechanism\tevidence_path\tline\tchecks\n'
+  {
+    file_mech import-linter "Python import contracts (layers, independence, forbidden imports)" '(^|/)\.importlinter$'
+    grep_mech import-linter "Python import contracts (layers, independence, forbidden imports)" '^\[(tool\.)?importlinter' 'setup.cfg' '*/setup.cfg' 'pyproject.toml' '*/pyproject.toml' 'tox.ini'
+    file_mech dependency-cruiser "JS/TS dependency rules" '(^|/)\.dependency-cruiser\.(js|cjs|mjs|json)$'
+    grep_mech eslint-import-rules "JS/TS import restrictions or cycle checks" '(import/no-restricted-paths|import/no-cycle|boundaries/element-types|no-restricted-imports)' '*eslint*' '*/.eslintrc*' '.eslintrc*'
+    grep_mech archunit "JVM architecture rules as tests" 'com\.tngtech\.archunit' '*.java' '*.kt' '*.gradle' '*.gradle.kts' 'pom.xml' '*/pom.xml'
+    file_mech java-module-system "Java module exports (module-info.java)" '(^|/)module-info\.java$'
+    grep_mech bazel-visibility "Bazel target visibility" 'visibility[[:space:]]*=' 'BUILD' '*/BUILD' 'BUILD.bazel' '*/BUILD.bazel'
+    # Go: any directory named internal restricts who may import below it.
+    # One row per internal directory, citing its first Go file.
+    awk -F'\t' 'NR > 1 && $1 ~ /\.go$/ && match($1, /(^|\/)internal\//) {
+        d = substr($1, 1, RSTART + RLENGTH - 2); sub(/^\//, "", d)
+        parent = d; sub(/\/?internal$/, "", parent); if (parent == "") parent = "the module root"; else parent = parent "/"
+        if (!(d in s)) { s[d] = 1; print "go-internal-package\t" $1 "\t1\tGo compiler allows imports of " d "/ only from within " parent }
+      }' "$W/files.tsv"
+    file_mech codeowners "review routing; needs branch protection to enforce, which is not visible here" '(^|/)(\.github/|docs/)?CODEOWNERS$'
+  } | sort -t "$(printf '\t')" -k1,1 -k2,2
+} > "$W/enforcement.tsv"
+
+# ---------------------------------------------------------------------------
+# summary.json, then move everything into place. No timestamp of the run is
+# recorded here, so the output depends only on the commit.
+# ---------------------------------------------------------------------------
+for f in files churn cochange imports fanin enforcement; do
+  cp "$W/$f.tsv" "$OUT/$f.tsv.tmp.$$" && mv -f "$OUT/$f.tsv.tmp.$$" "$OUT/$f.tsv"
+done
+
+langs="$(awk -F'\t' -v measured="$MEASURED_LANGS" '
+  BEGIN { n = split(measured, m, " "); for (i = 1; i <= n; i++) ml[m[i]] = 1 }
+  NR == 1 { next }
+  { files[$2]++; if ($3 != "-") lines[$2] += $3 }
+  END { for (l in files) printf "%s\t%d\t%d\t%s\n", l, files[l], lines[l], (l in ml) ? "true" : "false" }
+' "$W/files.tsv" | sort | jq -R -s -c '
+  split("\n") | map(select(length > 0) | split("\t"))
+  | map({key: .[0], value: {files: (.[1] | tonumber), lines: (.[2] | tonumber), imports_measured: (.[3] == "true")}})
+  | from_entries')"
+
+hashes='{}'
+for f in files churn cochange imports fanin enforcement; do
+  hashes="$(jq -c --arg k "$f.tsv" --arg v "$(sha256_file "$OUT/$f.tsv")" '. + {($k): $v}' <<<"$hashes")"
+done
+rows='{}'
+for f in files churn cochange imports fanin enforcement; do
+  rows="$(jq -c --arg k "$f.tsv" --argjson v "$(($(wc -l < "$OUT/$f.tsv") - 1))" '. + {($k): $v}' <<<"$rows")"
+done
+
+jq -n \
+  --arg commit "$SHA" --arg prefix "$PREFIX" \
+  --arg cdate "$(git show -s --format=%cI "$SHA")" \
+  --argjson start "$START_TS" --argjson end "$END_TS" --argjson days "$WINDOW_DAYS" \
+  --argjson bulk "$BULK_FILES" --argjson min "$MIN_TOGETHER" \
+  --argjson commits_all "$COMMITS_ALL" --argjson commits_window "$COMMITS_WINDOW" \
+  --arg shallow "$IS_SHALLOW" --argjson langs "$langs" --argjson hashes "$hashes" --argjson rows "$rows" '
+  {
+    schema_version: 1,
+    generated_by: "bin/measure",
+    meaning: "Deterministic measurements of the tree and history at this commit. They are inputs to the assessment, not findings. Cite a row as <dir>/metrics/<file>.tsv:<line>, where line 1 is the header.",
+    commit: $commit,
+    repo_prefix: $prefix,
+    committer_date: $cdate,
+    window: {days: $days, start: ($start | todate), end: ($end | todate), anchored_to: "the commit committer date, not the time of the run"},
+    history: {commits_all: $commits_all, commits_window: $commits_window,
+              shallow: (if $shallow == "true" then true elif $shallow == "false" then false else "unknown" end)},
+    languages: $langs,
+    rows: $rows,
+    methods: {
+      "files.tsv": "git ls-tree and git diff --numstat against the empty tree at the commit. Lines are git'"'"'s count (a last line without a newline counts). Binary files, as git classifies them, show -. Symlinks and submodules are omitted.",
+      "churn.tsv": "git log --no-merges at the commit, restricted to the target. commits_window counts commits in the window; authors_window counts distinct author emails (after .mailmap) in the window; emails are never written. Renames are not followed, so a renamed file starts again at zero.",
+      "cochange.tsv": ("Pairs of files present at the commit that changed in the same commit within the window. Commits touching more than \($bulk) files are skipped. Pairs changing together fewer than \($min) times are omitted. confidence = together / min(support_a, support_b)."),
+      "imports.tsv": "Regular expressions over import statements in Python, JavaScript/TypeScript, Go, Java, and Kotlin, resolved to files or package directories where possible. Misses dynamic imports, tsconfig path aliases, re-exports, and Python namespace packages; can match import-like text in strings or comments. Files in other languages are not measured.",
+      "fanin.tsv": "From imports.tsv internal rows: distinct importing files and distinct importing directories per imported file or package. Self-imports are excluded.",
+      "enforcement.tsv": "Configuration that can enforce architectural rules, found by file name or content. Present does not mean enforced: whether CI runs the check is not visible from the tree."
+    },
+    sha256: $hashes
+  }' | write_atomic "$OUT/summary.json"
+
+echo "measured ${SHA:0:12}: $(jq -r '[.rows | to_entries[] | "\(.key) \(.value)"] | join(", ")' "$OUT/summary.json") rows; window ends $(git show -s --format=%cs "$SHA")"
