@@ -1004,8 +1004,11 @@ run_step() {
   rc="${rcs[0]}"
   ended="$(now_utc)"
 
-  init="$(jq -cR 'fromjson? | select(.type == "system" and .subtype == "init")' "$WORK/$step.jsonl" | head -n1)"
-  result="$(jq -cR 'fromjson? | select(.type == "result")' "$WORK/$step.jsonl" | tail -n1)"
+  # Select inside jq, not with head: subagents emit their own init events,
+  # and head closing the pipe early would fail the step under pipefail.
+  # The session's own init event is the first one.
+  init="$(jq -cRn '[inputs | fromjson? | select(.type == "system" and .subtype == "init")] | first // empty' "$WORK/$step.jsonl")"
+  result="$(jq -cRn '[inputs | fromjson? | select(.type == "result")] | last // empty' "$WORK/$step.jsonl")"
   [ -n "$init" ] || init='{}'
   [ -n "$result" ] || result='{}'
 
