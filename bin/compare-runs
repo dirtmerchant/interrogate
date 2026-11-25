@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Compare several assessment runs of the same commit and report how much they
+# agree. No model is involved: it reads each run's run.json and
+# citations.json (which already hold the parsed citations and findings
+# indexes) and computes agreement.
+#
+# Model output varies between runs. This doesn't remove that variance; it
+# measures it, so a reader can tell findings every run produced from
+# findings only one run produced.
+#
+# Needs bash 3.2+ and jq.
+set -euo pipefail
+
+SELF="compare-runs"
+PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$PLUGIN_ROOT/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: compare-runs [--out FILE] [--json] run-dir run-dir [run-dir ...]
+
+Each run-dir is a notes directory written by bin/interrogate (for example
+with --run-dir .interrogate/runs/a). All runs must have assessed the same
+commit.
+
+Reports, per step:
+  - file agreement: Jaccard overlap of the sets of cited files, averaged
+    over every pair of runs
+  - line agreement: the share of one run's citations that overlap a citation
+    of the same file in the other run, averaged over pairs and directions
+  - which cited files appear in every run and which in only one
+and, from the findings indexes:
+  - hotspots: overlap of the ranked lists, and rank-order agreement
+  - patterns: patterns found in every run, and whether the runs agree on
+    Enforced or Aspirational
+
+Options:
+  --out FILE   Where to write agreement.json (default: next to the first
+               run directory, <parent>/agreement.json).
+  --json       Print agreement.json to stdout instead of the text report.
+  -h, --help   Show this help.
+EOF
+}
+
+OUTFILE=""
+JSON=0
+DIRS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out)  OUTFILE="${2:?--out needs a value}"; shift 2 ;;
+    --json) JSON=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "$SELF: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *)  DIRS+=("${1%/}"); shift ;;
+  esac
+done
+
+need_jq "$SELF"
+[ ${#DIRS[@]} -ge 2 ] || { echo "$SELF: give at least two run directories" >&2; usage >&2; exit 2; }
+
+W="$(mktemp -d "${TMPDIR:-/tmp}/compare-runs.XXXXXX")"
+trap 'rm -rf "$W"' EXIT
+: > "$W/runs"
+
+for d in "${DIRS[@]}"; do
+  [ -f "$d/run.json" ] || { echo "$SELF: $d has no run.json; is it a run directory?" >&2; exit 2; }
+  [ -f "$d/citations.json" ] || { echo "$SELF: $d has no citations.json; run check-citations on it, or re-run without --no-verify" >&2; exit 2; }
+  # The citations.json must be the one the run recorded last; otherwise the
+  # notes may have changed since it was written.
+  cit_hash="$(sha256_file "$d/citations.json")"
+  jq -c --arg dir "$d" --arg h "$cit_hash" --slurpfile c "$d/citations.json" '{
+      dir: $dir,
+      commit: .target.commit,
+      citations_current: ((.citation_checks // []) | (length > 0 and .[-1].citations_json_sha256 == $h)),
+      steps: [.steps[] | select(.status == "completed") | {step, model, effort_requested, skill_sha256, session_id, cost_usd}],
+      citations: $c[0].citations,
+      indexes: ($c[0].indexes // []),
+      notes_dir: (.invocations[-1].options.run_dir // ".interrogate")
+    }' "$d/run.json" >> "$W/runs"
+done
+
+commits="$(jq -r '.commit // "none"' "$W/runs" | sort -u)"
+if [ "$(printf '%s\n' "$commits" | wc -l | tr -d ' ')" -ne 1 ]; then
+  echo "$SELF: the runs assessed different commits, so their findings can't be compared:" >&2
+  jq -r '"  \(.dir): \(.commit // "none")"' "$W/runs" >&2
+  exit 1
+fi
+
+cat > "$W/compare.jq" <<'JQ'
+def step_of($f):
+  ($f | sub(".*/"; "")) as $b
+  | {"01-orient.md": "orient", "02-patterns.md": "patterns", "03-boundaries.md": "boundaries",
+     "04-trace.md": "trace", "05-hotspots.md": "hotspots", "06-critique.md": "critique",
+     "issues.md": "capture", "CLAUDE.proposed.md": "capture", "ARCHITECTURE.proposed.md": "capture",
+     "ARCHITECTURE.md": "capture"}[$b] // null;
+def mean: if length == 0 then null else (add / length * 1000 | round / 1000) end;
+def jaccard($a; $b): ($a + $b | unique | length) as $u
+  | if $u == 0 then null else ([$a[] | select(. as $x | $b | index([$x]))] | unique | length) / $u end;
+def pairs($n): [range(0; $n) as $i | range($i + 1; $n) as $j | [$i, $j]];
+def overlaps($c; $set): any($set[]; .path == $c.path and .start <= $c.end and $c.start <= .end);
+def norm_name: ascii_downcase | gsub("[^a-z0-9]"; "");
+# Kendall-style agreement on the order of items two rankings share:
+# (concordant - discordant) / pairs, from -1 (reversed) to 1 (same order).
+def rank_agreement($a; $b):
+  [$a[] | select(. as $x | $b | index([$x]))] as $common
+  | if ($common | length) < 2 then null else
+      [pairs($common | length)[] as [$i, $j]
+        | ($a | index([$common[$i]])) as $ai | ($a | index([$common[$j]])) as $aj
+        | ($b | index([$common[$i]])) as $bi | ($b | index([$common[$j]])) as $bj
+        | if (($ai - $aj) * ($bi - $bj)) > 0 then 1 else -1 end]
+      | add / length end;
+
+. as $runs
+| ($runs | length) as $n
+# Code citations only: citations of a run's own notes or metrics are left out.
+| ($runs | map(.notes_dir as $nd | .citations | map(select(.path != null and .status == "pass"
+      and (.path | startswith($nd + "/") | not) and (.path | startswith(".interrogate/") | not))
+      | . + {step: step_of(.notes_file)}))) as $cites
+| ([$runs[].steps[].step] | unique) as $allsteps
+| {
+    schema_version: 1,
+    generated_by: "bin/compare-runs",
+    meaning: "Agreement between independent runs on the same commit. High agreement means the runs pointed at the same code, not that the findings are right. A finding cited by only one run is a lead to check, not a conclusion.",
+    commit: $runs[0].commit,
+    runs: [$runs[] | {dir, citations_current, steps: (.steps | map({step, model, effort_requested, skill_sha256, cost_usd}))}],
+    warnings: (
+      [$runs[] | select(.citations_current | not) | "\(.dir): citations.json is not the one run.json recorded last; the notes may have changed since"]
+      + [$allsteps[] as $s
+          | ([$runs[] | [.steps[] | select(.step == $s)] | last | .skill_sha256] | map(select(. != null)) | unique) as $h
+          | select(($h | length) > 1) | "\($s): runs used different versions of the skill prompt"]
+      + [$allsteps[] as $s
+          | ([$runs[] | [.steps[] | select(.step == $s)] | last | .model] | map(select(. != null)) | unique) as $m
+          | select(($m | length) > 1) | "\($s): runs used different models: \($m | join(", "))"]
+      + [$allsteps[] as $s
+          | ([$runs[] | [.steps[] | select(.step == $s)] | last | (.effort_requested // "default")] | unique) as $e
+          | select(($e | length) > 1) | "\($s): runs used different effort levels: \($e | join(", "))"]
+    ),
+    steps: ([$allsteps[] as $s
+      | [range(0; $n) | select(. as $i | $cites[$i] | any(.step == $s))] as $have
+      | select(($have | length) >= 2)
+      | ($have | map(. as $i | $cites[$i] | map(select(.step == $s)))) as $sc
+      | ($sc | map(map(.path) | unique)) as $files
+      | {key: $s, value: {
+          runs: ($have | length),
+          file_agreement: ([pairs($sc | length)[] as [$i, $j] | jaccard($files[$i]; $files[$j])] | map(select(. != null)) | mean),
+          line_agreement: ([pairs($sc | length)[] as [$i, $j]
+              | (if ($sc[$i] | length) > 0 then ([$sc[$i][] | select(overlaps(.; $sc[$j]))] | length) / ($sc[$i] | length) else empty end),
+                (if ($sc[$j] | length) > 0 then ([$sc[$j][] | select(overlaps(.; $sc[$i]))] | length) / ($sc[$j] | length) else empty end)
+            ] | mean),
+          files_in_every_run: ($files | reduce .[1:][] as $f (.[0]; [.[] | select(. as $x | $f | index([$x]))])),
+          files_in_one_run: ([$files[][]] | group_by(.) | map(select(length == 1) | .[0])),
+          citations_per_run: ($sc | map(length)),
+          citations_in_every_run: ([$sc[0][] | select(. as $c | all(range(1; $sc | length); overlaps($c; $sc[.])))]
+              | map("\(.path):\(.start)\(if .end != .start then "-\(.end)" else "" end)") | unique)
+        }}] | from_entries),
+    hotspots: (
+      [$runs[] | [.indexes[] | select(.kind == "hotspots" and .status == "pass")] | last | (.rows // null) | if . then map(.path) else null end] as $lists
+      | [$lists[] | select(. != null)] as $l
+      | if ($l | length) < 2 then {compared: false, reason: "fewer than two runs have a valid hotspots index"} else {
+          compared: true,
+          runs: ($l | length),
+          lists: $l,
+          overlap: ([pairs($l | length)[] as [$i, $j] | jaccard($l[$i]; $l[$j])] | mean),
+          rank_agreement: ([pairs($l | length)[] as [$i, $j] | rank_agreement($l[$i]; $l[$j])] | map(select(. != null)) | mean),
+          in_every_run: ($l | reduce .[1:][] as $f (.[0]; [.[] | select(. as $x | $f | index([$x]))])),
+          in_one_run: ([$l[][]] | group_by(.) | map(select(length == 1) | .[0]))
+        } end),
+    patterns: (
+      [$runs[] | [.indexes[] | select(.kind == "patterns" and .status == "pass")] | last | (.rows // null)] as $p
+      | [$p[] | select(. != null)] as $l
+      | if ($l | length) < 2 then {compared: false, reason: "fewer than two runs have a valid patterns index"} else
+          ([$l[][] | .pattern | norm_name] | unique) as $names
+          | [$names[] as $k | {
+              key: $k,
+              names: [$l[][] | select((.pattern | norm_name) == $k) | .pattern] | unique,
+              runs: ([$l[] | select(any(.[]; (.pattern | norm_name) == $k))] | length),
+              statuses: [$l[][] | select((.pattern | norm_name) == $k) | .status],
+              violations: [$l[][] | select((.pattern | norm_name) == $k) | .violations]
+            }] as $by
+          | {
+              compared: true,
+              runs: ($l | length),
+              in_every_run: [$by[] | select(.runs == ($l | length)) | {pattern: .names[0], status_agrees: ((.statuses | unique | length) == 1), statuses, violations}],
+              in_some_runs: [$by[] | select(.runs < ($l | length)) | {pattern: .names[0], runs, statuses}],
+              status_agreement: ([$by[] | select(.runs == ($l | length)) | if (.statuses | unique | length) == 1 then 1 else 0 end] | mean)
+            } end)
+  }
+JQ
+
+report="$(jq -s -f "$W/compare.jq" "$W/runs")"
+
+if [ -z "$OUTFILE" ]; then OUTFILE="$(dirname "${DIRS[0]}")/agreement.json"; fi
+printf '%s\n' "$report" | write_atomic "$OUTFILE"
+
+if [ "$JSON" -eq 1 ]; then printf '%s\n' "$report"; exit 0; fi
+
+printf '%s\n' "$report" | jq -r --arg out "$OUTFILE" '
+  def pct: if . == null then "n/a" else "\(. * 100 | round)%" end;
+  "Agreement across \(.runs | length) runs of commit \(.commit[0:12])",
+  "(agreement means the runs pointed at the same code; it does not mean they are right)",
+  "",
+  (if (.warnings | length) > 0 then ("Warnings:", (.warnings[] | "  - \(.)"), "") else empty end),
+  "Citations by step (pass citations of code only):",
+  (.steps | to_entries[] | "  \(.key | . + "          " | .[0:11]) files \(.value.file_agreement | pct)  lines \(.value.line_agreement | pct)  citations per run \(.value.citations_per_run | map(tostring) | join("/"))  files in every run \(.value.files_in_every_run | length), in one run \(.value.files_in_one_run | length)"),
+  "",
+  (if .hotspots.compared then
+    ("Hotspots (\(.hotspots.runs) runs): overlap \(.hotspots.overlap | pct), rank agreement \(.hotspots.rank_agreement | if . == null then "n/a" else (. * 100 | round / 100 | tostring) end) (1 = same order, -1 = reversed)",
+     "  in every run: \(.hotspots.in_every_run | join(", ") | if . == "" then "none" else . end)",
+     "  in one run:   \(.hotspots.in_one_run | join(", ") | if . == "" then "none" else . end)")
+   else "Hotspots: not compared (\(.hotspots.reason))" end),
+  "",
+  (if .patterns.compared then
+    ("Patterns (\(.patterns.runs) runs): found in every run \(.patterns.in_every_run | length), status agreement among them \(.patterns.status_agreement | pct)",
+     (.patterns.in_every_run[] | "  \(if .status_agrees then "same  " else "DIFFER" end) \(.pattern): \(.statuses | join(" / ")), violations \(.violations | map(tostring) | join(" / "))"),
+     (.patterns.in_some_runs[] | "  some   \(.pattern): in \(.runs) of the runs (\(.statuses | join(" / ")))"))
+   else "Patterns: not compared (\(.patterns.reason))" end),
+  "",
+  "Written to \($out)"'
