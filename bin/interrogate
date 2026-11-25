@@ -962,11 +962,19 @@ run_step() {
   if [ "$TRUST" -eq 0 ]; then set -- "$@" --setting-sources user; fi
   if [ -n "$MODEL" ]; then set -- "$@" --model "$MODEL"; fi
   if [ -n "$EFFORT" ]; then set -- "$@" --effort "$EFFORT"; fi
-  # The skills name .interrogate/ as their notes directory. With --run-dir,
-  # tell the session where this run's notes are instead.
+  # Notes for the unattended session. These say how the run is set up; they
+  # don't change what the step assesses.
+  #  - dontAsk denies compound shell commands (loops, variables, $(...)),
+  #    and in early runs a single denial led the model to stop using Bash
+  #    for the whole step. Say up front what works.
+  #  - The exact form for citing a measurement, which check-citations checks.
+  #  - With --run-dir, where this run's notes are: the skills say .interrogate/.
+  sys="This is an unattended assessment run. Shell commands run without approval only when each Bash call is one simple read-only command, or a pipeline of them, such as git log, git show, ls, or grep. Loops, variable assignments, command substitution, and chained commands are denied, so run one simple command per call. Reading files with the Read tool always works."
+  sys="$sys Measurements of the assessed commit are in $OUT/metrics/. Cite a row of one as $OUT/metrics/<file>:<line>, for example $OUT/metrics/churn.tsv:12, where line 1 is the header."
   if [ "$OUT" != ".interrogate" ]; then
-    set -- "$@" --append-system-prompt "For this assessment run, the notes directory is $OUT/ (relative to the current working directory). Wherever the instructions say .interrogate/, read and write $OUT/ instead. Don't read or write notes anywhere else under .interrogate/."
+    sys="$sys For this run, the notes directory is $OUT/ (relative to the current working directory). Wherever the instructions say .interrogate/, read and write $OUT/ instead. Don't read or write notes anywhere else under .interrogate/."
   fi
+  set -- "$@" --append-system-prompt "$sys"
 
   echo "== $step"
   if [ "$DRY" -eq 1 ]; then
@@ -1040,7 +1048,7 @@ run_step() {
     --arg skill "$(sha256_file "$PLUGIN_ROOT/skills/$step/SKILL.md")" \
     --arg allow "$allow" --arg deny "$deny" --argjson outputs "$outputs" \
     --arg arch "$arch_after" --argjson reported "$reported" --argjson mismatch "$mismatch" \
-    --arg effort "$EFFORT" '
+    --arg effort "$EFFORT" --arg sys "$sys" '
     def nz: if . == "" then null else . end;
     # jq'"'"'s // treats false as missing, so booleans are read with has().
     def field($o; $k; $d): if ($o | has($k)) then $o[$k] else $d end;
@@ -1067,6 +1075,7 @@ run_step() {
       permission_denials: (($result.permission_denials // []) | map({tool: .tool_name, command: (.tool_input.command // .tool_input.file_path // null | if type == "string" then .[0:300] else . end)})),
       skill_sha256: $skill,
       allowed_tools: ($allow | split(",")),
+      appended_system_prompt: $sys,
       disallowed_tools: ($deny | split(",")),
       outputs: $outputs,
       architecture_md_sha256: ($arch | nz),

@@ -39,8 +39,10 @@ Options:
   -q, --quiet       Print only the summary line and failures.
   -h, --help        Show this help.
 
-Citations of the measurements, <dir>/metrics/<file>.tsv:<row>, resolve
-against those files, where row 1 is the header line.
+Citations of the measurements, <dir>/metrics/<file>:<row>, resolve against
+those files, where row 1 is the header line. The short forms
+metrics/<file>:<row> and <file>:<row> (for the metrics file names) are
+accepted when no file by that name exists in the code.
 
 Notes files that contain a findings index (a "<!-- findings-index: KIND -->"
 line followed by a table) are also checked: the table must have the expected
@@ -152,6 +154,14 @@ normalize() {
   }'
 }
 
+exists_in_code() {
+  if [ "$MODE" = "commit" ]; then
+    git cat-file -e "$COMMIT:$PREFIX$1" 2>/dev/null
+  else
+    [ -e "$1" ]
+  fi
+}
+
 total_files=0
 if [ ${#NOTES[@]} -gt 0 ]; then
 for nf in "${NOTES[@]}"; do
@@ -187,8 +197,18 @@ for nf in "${NOTES[@]}"; do
     norm=""
     if [ -z "$pre" ]; then
       norm="$(normalize "$path")"
+      # Models often shorten a metrics citation to metrics/churn.tsv:12 or
+      # churn.tsv:12. Treat those as this run's metrics, but only when no
+      # file by that name exists in the code, so a real file always wins.
       case "$norm" in
-        "$DIR"/metrics/*.tsv) pre="metric" ;;
+        metrics/*|.interrogate/metrics/*|files.tsv|churn.tsv|cochange.tsv|imports.tsv|fanin.tsv|enforcement.tsv|summary.json)
+          mbase="${norm##*/}"
+          if [ "$norm" != "$DIR/metrics/$mbase" ] && [ -f "$DIR/metrics/$mbase" ] && ! exists_in_code "$norm"; then
+            norm="$DIR/metrics/$mbase"
+          fi ;;
+      esac
+      case "$norm" in
+        "$DIR"/metrics/*) pre="metric" ;;
         "$DIR"/*|.interrogate/*) pre="skip:cites the notes, not the code" ;;
         ESCAPE) pre="fail:path climbs above the target" ;;
       esac
@@ -213,7 +233,7 @@ fi
 awk -F'\t' '$7 == "" { print $4 }' "$W/cites" | sort -u | while IFS= read -r p; do
   [ -n "$p" ] || continue
   case "$p" in
-    "$DIR"/metrics/*.tsv)
+    "$DIR"/metrics/*)
       if [ -f "$p" ]; then printf '%s\tfile\t%s\n' "$p" "$(awk 'END { print NR }' "$p")"
       else printf '%s\tmissing\t0\n' "$p"; fi
       continue ;;
