@@ -1,8 +1,29 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="interrogate: seven questions for a codebase you have never seen. Every answer cites file:line." width="100%">
+</p>
+
+<p align="center">
+  <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-f0b429?style=flat-square&labelColor=0d1117">
+  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-e6edf3?style=flat-square&labelColor=0d1117">
+  <img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-d29922?style=flat-square&labelColor=0d1117">
+  <img alt="Runner: Bash 3.2 or later" src="https://img.shields.io/badge/runner-bash_3.2+-9da7b3?style=flat-square&labelColor=0d1117">
+</p>
+
 # interrogate
 
 A Claude Code plugin for assessing the architecture of a codebase you haven't seen before.
 
 It runs seven steps, each in a fresh context window. Every finding has to cite `path:line`, and the steps separate what the code enforces from what it only claims.
+
+```mermaid
+flowchart LR
+    S1[1 orient] --> S2[2 patterns] --> S3[3 boundaries] --> S4[4 trace] --> S5[5 hotspots] --> S6[6 critique] --> S7[7 capture]
+    S7 --> A([ARCHITECTURE.md])
+    S7 --> I([issues.md])
+    S7 --> C([CLAUDE.proposed.md])
+```
+
+Each arrow is a fresh context. A step hands the next one a notes file, and nothing else.
 
 > **Status: 0.1.0, not yet run end to end.** The plugin and marketplace manifests pass `claude plugin validate`, and the runner's argument handling, dry run, resume, and failure paths are tested. No step has been run against a model yet. Expect to adjust the prompts after the first real run, and please open an issue with what you find.
 
@@ -11,6 +32,7 @@ It runs seven steps, each in a fresh context window. Every finding has to cite `
 - [Why seven steps](#why-seven-steps)
 - [Quick start](#quick-start)
 - [The steps](#the-steps)
+- [What a finding looks like](#what-a-finding-looks-like)
 - [What gets written](#what-gets-written)
 - [Running unattended](#running-unattended)
 - [Running interactively](#running-interactively)
@@ -67,6 +89,31 @@ Notes on individual steps:
 - **Hotspots** uses fan-in counts and git history (churn and co-change). In a repository with no history or a shallow clone it says so and falls back to fan-in.
 - **Critique** has to rank by severity, say what evidence would change each finding, and list what the design gets right to the same standard.
 - **Capture** doesn't explore again. It does re-check at least ten citations before writing and reports how many failed.
+
+## What a finding looks like
+
+The steps are told to write findings in this shape. This example is illustrative. It was written by hand to show the format, and is not output from a real run.
+
+```markdown
+### Layered architecture (handlers → services → store)
+
+**Status: Aspirational.** Nothing stops a handler from importing the store.
+The README describes three layers; no lint rule, visibility boundary, or test
+checks them.
+
+Evidence for the pattern:
+- `api/handlers/orders.py:41` calls `OrderService.create`  (Confirmed)
+- `services/orders.py:88` is the only caller of `store.orders.insert`  (Confirmed)
+
+Violations (3):
+| Location | What it does instead |
+| :- | :- |
+| `api/handlers/reports.py:27` | Runs SQL through `store.db` directly |
+| `api/handlers/admin.py:63` | Imports `store.models` and mutates a row |
+| `jobs/cleanup.py:19` | Bypasses the service layer to delete orders |
+
+Confidence: high for `api/`, not checked for `integrations/`.
+```
 
 ## What gets written
 
